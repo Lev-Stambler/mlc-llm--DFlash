@@ -190,6 +190,60 @@ class EngineAction : public ObjectRef {
                                        EngineConfig engine_config,
                                        Optional<EventTraceRecorder> trace_recorder);
   /*!
+   * \brief Create the DFlash prefill action that computes hidden states and drafts a block.
+   * \param models The models to run prefill in.
+   * \param logit_processor The logit processor.
+   * \param sampler The sampler to sample new tokens.
+   * \param model_workspaces The workspace of each model.
+   * \param draft_token_workspace_manager The draft token workspace manager.
+   * \param engine_config The engine config.
+   * \param model_configs The config of each model.
+   * \param trace_recorder The event trace recorder for requests.
+   * \return The created action object.
+   */
+  static EngineAction DFlashNewRequestPrefill(
+      Array<Model> models, LogitProcessor logit_processor, Sampler sampler,
+      std::vector<ModelWorkspace> model_workspaces,
+      DraftTokenWorkspaceManager draft_token_workspace_manager, EngineConfig engine_config,
+      std::vector<tvm::ffi::json::Object> model_configs,
+      Optional<EventTraceRecorder> trace_recorder);
+
+  /*!
+   * \brief Create the DFlash batch draft action — single-pass block diffusion draft.
+   * \param models The models to run draft in.
+   * \param logit_processor The logit processor.
+   * \param sampler The sampler to sample new tokens.
+   * \param model_workspaces The workspace of each model.
+   * \param draft_token_workspace_manager The draft token workspace manager.
+   * \param engine_config The engine config.
+   * \param trace_recorder The event trace recorder for requests.
+   * \return The created action object.
+   */
+  static EngineAction DFlashBatchDraft(Array<Model> models, LogitProcessor logit_processor,
+                                       Sampler sampler, std::vector<ModelWorkspace> model_workspaces,
+                                       DraftTokenWorkspaceManager draft_token_workspace_manager,
+                                       EngineConfig engine_config,
+                                       Optional<EventTraceRecorder> trace_recorder);
+
+  /*!
+   * \brief Create the DFlash batch verify action — verify with hidden state extraction.
+   * \param models The models to run verification in.
+   * \param logit_processor The logit processor.
+   * \param sampler The sampler to sample new tokens.
+   * \param model_workspaces The workspace of each model.
+   * \param draft_token_workspace_manager The draft token workspace manager.
+   * \param engine_config The engine config.
+   * \param trace_recorder The event trace recorder for requests.
+   * \return The created action object.
+   */
+  static EngineAction DFlashBatchVerify(Array<Model> models, LogitProcessor logit_processor,
+                                        Sampler sampler,
+                                        std::vector<ModelWorkspace> model_workspaces,
+                                        DraftTokenWorkspaceManager draft_token_workspace_manager,
+                                        EngineConfig engine_config,
+                                        Optional<EventTraceRecorder> trace_recorder);
+
+  /*!
    * \brief Create the action that executes the jump-forward decoding to predict the next tokens
    * according to the grammar constraint. Does nothing for the requests without grammar. The
    * predicted tokens will be fed to the next BatchDecode action. Retokenization may happen when

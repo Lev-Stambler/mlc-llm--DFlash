@@ -1059,6 +1059,177 @@ class ModelImpl : public ModelObj {
     return logits;
   }
 
+  /********************** DFlash Speculative Decoding **********************/
+
+  std::pair<Tensor, ObjectRef> BatchPrefillWithHiddenStates(
+      const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
+      const std::vector<int>& lengths) final {
+    TVM_FFI_ICHECK(!seq_ids.empty());
+    TVM_FFI_ICHECK_EQ(seq_ids.size(), lengths.size());
+    int num_sequences = seq_ids.size();
+    int total_length = 0;
+    int* p_logit_pos = static_cast<int*>(logit_pos_arr_->data);
+    for (int i = 0; i < num_sequences; ++i) {
+      total_length += lengths[i];
+      p_logit_pos[i] = total_length - 1;
+    }
+
+    NVTXScopedRange nvtx_scope("BatchPrefillWithHiddenStates num_seq=" +
+                                std::to_string(num_sequences));
+    Tensor logit_pos_nd = logit_pos_arr_.CreateView({num_sequences}, DataType::Int(32));
+
+    TVM_FFI_ICHECK(ft_.prefill_with_hidden_states_func_.defined())
+        << "`batch_prefill_with_hidden_states` function is not found in the model.";
+    TVM_FFI_ICHECK(ft_.kv_cache_begin_forward_func_.defined());
+    TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
+    TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
+
+    IntTuple seq_ids_tuple(seq_ids);
+    IntTuple lengths_tuple(lengths.begin(), lengths.end());
+    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
+
+    ObjectRef embeddings_dref_or_nd;
+    if (!embeddings->IsInstance<DRefObj>()) {
+      Tensor embeddings_nd = Downcast<Tensor>(embeddings);
+      TVM_FFI_ICHECK_NE(hidden_size_, -1);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->ndim, 2);
+      TVM_FFI_ICHECK_GE(embeddings_nd->shape[0], total_length);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->shape[1], hidden_size_);
+      embeddings_dref_or_nd =
+          embeddings_nd.CreateView({1, total_length, hidden_size_}, embeddings_nd->dtype);
+    } else {
+      Shape embedding_shape{1, total_length, hidden_size_};
+      embeddings_dref_or_nd = ft_.nd_view_func_(embeddings, embedding_shape).cast<ObjectRef>();
+    }
+    TVM_FFI_ICHECK_NE(max_num_sequence_, -1);
+    ObjectRef logit_pos_dref_or_nd =
+        ft_.CopyToWorker0(logit_pos_nd, "logit_pos", {max_num_sequence_});
+
+    // Call batch_prefill_with_hidden_states: returns (logits, target_hidden, kv_cache)
+    ObjectRef result = ft_.prefill_with_hidden_states_func_(embeddings_dref_or_nd,
+                                                             logit_pos_dref_or_nd, kv_cache_,
+                                                             params_)
+                           .cast<ObjectRef>();
+    ft_.kv_cache_end_forward_func_(kv_cache_);
+
+    // Extract logits (index 0) and target_hidden (index 1)
+    ObjectRef logits_ref = ft_.tuple_getitem_func_(result, 0).cast<ObjectRef>();
+    ObjectRef target_hidden = ft_.tuple_getitem_func_(result, 1).cast<ObjectRef>();
+
+    Tensor logits;
+    if (ft_.use_disco) {
+      logits = Downcast<DRef>(logits_ref)->DebugGetFromRemote(0).cast<Tensor>();
+    } else {
+      logits = Downcast<Tensor>(logits_ref);
+    }
+    if (trace_enabled_) {
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+    }
+
+    // logits: (1, num_sequences, v)
+    TVM_FFI_ICHECK_EQ(logits->ndim, 3);
+    TVM_FFI_ICHECK_EQ(logits->shape[0], 1);
+    TVM_FFI_ICHECK_EQ(logits->shape[1], num_sequences);
+    return {logits, target_hidden};
+  }
+
+  std::pair<Tensor, ObjectRef> BatchVerifyWithHiddenStates(
+      const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
+      const std::vector<int>& lengths,
+      const std::vector<int64_t>& token_tree_parent_ptr) final {
+    TVM_FFI_ICHECK(!seq_ids.empty());
+    TVM_FFI_ICHECK_EQ(seq_ids.size(), lengths.size());
+    int num_sequences = seq_ids.size();
+    int total_length = 0;
+    for (int i = 0; i < num_sequences; ++i) {
+      total_length += lengths[i];
+    }
+    TVM_FFI_ICHECK_EQ(total_length, static_cast<int>(token_tree_parent_ptr.size()));
+
+    NVTXScopedRange nvtx_scope("BatchVerifyWithHiddenStates num_tokens=" +
+                                std::to_string(total_length));
+
+    TVM_FFI_ICHECK(ft_.verify_with_hidden_states_func_.defined())
+        << "`batch_verify_with_hidden_states` function is not found in the model.";
+    TVM_FFI_ICHECK(ft_.kv_cache_begin_forward_func_.defined());
+    TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
+    TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
+
+    ObjectRef embeddings_dref_or_nd;
+    if (!embeddings->IsInstance<DRefObj>()) {
+      Tensor embeddings_nd = Downcast<Tensor>(embeddings);
+      TVM_FFI_ICHECK_NE(hidden_size_, -1);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->ndim, 2);
+      TVM_FFI_ICHECK_GE(embeddings_nd->shape[0], total_length);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->shape[1], hidden_size_);
+      embeddings_dref_or_nd =
+          embeddings_nd.CreateView({1, total_length, hidden_size_}, embeddings_nd->dtype);
+    } else {
+      Shape embedding_shape{1, total_length, hidden_size_};
+      embeddings_dref_or_nd = ft_.nd_view_func_(embeddings, embedding_shape).cast<ObjectRef>();
+    }
+
+    IntTuple seq_ids_tuple(seq_ids);
+    IntTuple lengths_tuple(lengths.begin(), lengths.end());
+    IntTuple token_tree_parent_ptr_tuple(token_tree_parent_ptr);
+    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple,
+                                     token_tree_parent_ptr_tuple);
+
+    // Call batch_verify_with_hidden_states: returns (logits, target_hidden, kv_cache)
+    ObjectRef result =
+        ft_.verify_with_hidden_states_func_(embeddings_dref_or_nd, kv_cache_, params_)
+            .cast<ObjectRef>();
+    ft_.kv_cache_end_forward_func_(kv_cache_);
+
+    // Extract logits (index 0) and target_hidden (index 1)
+    ObjectRef logits_ref = ft_.tuple_getitem_func_(result, 0).cast<ObjectRef>();
+    ObjectRef target_hidden = ft_.tuple_getitem_func_(result, 1).cast<ObjectRef>();
+
+    Tensor logits;
+    if (ft_.use_disco) {
+      logits = Downcast<DRef>(logits_ref)->DebugGetFromRemote(0).cast<Tensor>();
+    } else {
+      logits = Downcast<Tensor>(logits_ref);
+    }
+    if (trace_enabled_) {
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+    }
+
+    // logits: (1, total_length, v)
+    TVM_FFI_ICHECK_EQ(logits->ndim, 3);
+    TVM_FFI_ICHECK_EQ(logits->shape[0], 1);
+    TVM_FFI_ICHECK_EQ(logits->shape[1], total_length);
+    return {logits, target_hidden};
+  }
+
+  ObjectRef ProjectTargetHiddenStates(const ObjectRef& target_hidden) final {
+    NVTXScopedRange nvtx_scope("ProjectTargetHiddenStates");
+    TVM_FFI_ICHECK(ft_.project_target_hidden_func_.defined())
+        << "`project_target_hidden` function is not found in the model.";
+    ObjectRef result =
+        ft_.project_target_hidden_func_(target_hidden, params_).cast<ObjectRef>();
+    if (trace_enabled_) {
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+    }
+    return result;
+  }
+
+  ObjectRef DFlashDraftForward(const ObjectRef& draft_embeddings,
+                                const ObjectRef& projected_target_hidden, const ObjectRef& cos,
+                                const ObjectRef& sin, const ObjectRef& attention_mask) final {
+    NVTXScopedRange nvtx_scope("DFlashDraftForward");
+    TVM_FFI_ICHECK(ft_.dflash_draft_forward_func_.defined())
+        << "`draft_forward` function is not found in the model.";
+    ObjectRef result =
+        ft_.dflash_draft_forward_func_(draft_embeddings, projected_target_hidden, cos, sin,
+                                        attention_mask, params_)
+            .cast<ObjectRef>();
+    if (trace_enabled_) {
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+    }
+    return result;
+  }
+
   /************** Debug/Profile **************/
 
   void DebugCallFuncOnAllAllWorker(const String& func_name, Optional<String> func_args) final {
@@ -1077,6 +1248,9 @@ class ModelImpl : public ModelObj {
     this->attention_sink_size_ = std::max(this->attention_sink_size_, 0);
     this->vocab_size_ = json::Lookup<int64_t>(config, "vocab_size");
     this->model_type_ = json::Lookup<std::string>(config, "model_type");
+    // DFlash-related config (optional, present in DFlash models).
+    this->rope_theta_ = json::LookupOrDefault<double>(config, "rope_theta", 10000.0);
+    this->head_dim_ = json::LookupOrDefault<int64_t>(config, "head_dim", -1);
   }
 
   //----------------------------
@@ -1094,6 +1268,8 @@ class ModelImpl : public ModelObj {
   int vocab_size_ = -1;
   int image_embed_size_ = -1;
   int seqlen_padding_factor_ = 1;
+  double rope_theta_ = 10000.0;
+  int head_dim_ = -1;
   std::string model_type_;
   //----------------------------
   // TVM related states

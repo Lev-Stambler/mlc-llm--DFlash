@@ -140,6 +140,11 @@ struct FunctionTable {
   Function scatter_probs_func_;
   Function gather_hidden_states_func_;
   Function scatter_hidden_states_func_;
+  // DFlash speculative decoding functions.
+  Function prefill_with_hidden_states_func_;
+  Function verify_with_hidden_states_func_;
+  Function project_target_hidden_func_;
+  Function dflash_draft_forward_func_;
 };
 
 }  // namespace serve

@@ -454,13 +454,17 @@ class EngineImpl : public Engine {
     }
     // - Load model weights, create KV cache and workspace.
     n->model_workspaces_.clear();
-    for (const Model& model : n->models_) {
+    for (int model_id = 0; model_id < static_cast<int>(n->models_.size()); ++model_id) {
+      const Model& model = n->models_[model_id];
       model->LoadParams();
       model->SetMaxNumSequence(engine_config->max_num_sequence);
       model->SetPrefillChunkSize(engine_config->prefill_chunk_size);
-      model->CreateKVCache(engine_config->kv_cache_page_size, engine_config->max_num_sequence,
-                           engine_config->max_total_sequence_length,
-                           engine_config->prefill_chunk_size, engine_config->max_history_size);
+      // Skip KV cache creation for DFlash draft model (model_id > 0) — it is stateless.
+      if (!(engine_config->speculative_mode == SpeculativeMode::kDFlash && model_id > 0)) {
+        model->CreateKVCache(engine_config->kv_cache_page_size, engine_config->max_num_sequence,
+                             engine_config->max_total_sequence_length,
+                             engine_config->prefill_chunk_size, engine_config->max_history_size);
+      }
       n->model_workspaces_.push_back(
           ModelWorkspace{model->AllocEmbeddingTensor(), model->AllocHiddenStatesTensor()});
     }
@@ -478,7 +482,8 @@ class EngineImpl : public Engine {
           n->models_[0]->CreateDraftTokenWorkspaceManager(max_num_tokens * 2);
       draft_token_workspace_manager->AllocWorkspace(
           &n->model_workspaces_[0],
-          /*require_hidden_states=*/engine_config->speculative_mode == SpeculativeMode::kEagle);
+          /*require_hidden_states=*/engine_config->speculative_mode == SpeculativeMode::kEagle ||
+              engine_config->speculative_mode == SpeculativeMode::kDFlash);
     }
     LogitProcessor logit_processor =
         n->models_[0]->CreateLogitProcessor(max_num_tokens, trace_recorder);

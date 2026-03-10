@@ -213,6 +213,8 @@ enum class SpeculativeMode : int {
   kEagle = 2,
   /*! \brief The Medusa-style speculative decoding. */
   kMedusa = 3,
+  /*! \brief The DFlash block-diffusion speculative decoding. */
+  kDFlash = 4,
 };
 
 /*! \brief The prefill mode. */
@@ -418,6 +420,8 @@ inline std::string SpeculativeModeToString(SpeculativeMode speculative_mode) {
     return "eagle";
   } else if (speculative_mode == SpeculativeMode::kMedusa) {
     return "medusa";
+  } else if (speculative_mode == SpeculativeMode::kDFlash) {
+    return "dflash";
   } else {
     LOG(FATAL) << "Invalid speculative mode: " << static_cast<int>(speculative_mode);
   }
@@ -432,6 +436,8 @@ inline SpeculativeMode SpeculativeModeFromString(const std::string& speculative_
     return SpeculativeMode::kEagle;
   } else if (speculative_mode == "medusa") {
     return SpeculativeMode::kMedusa;
+  } else if (speculative_mode == "dflash") {
+    return SpeculativeMode::kDFlash;
   } else {
     LOG(FATAL) << "Invalid speculative mode string: " << speculative_mode;
     throw;

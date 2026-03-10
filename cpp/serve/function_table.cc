@@ -289,6 +289,11 @@ void FunctionTable::_InitFunctions() {
   this->scatter_probs_func_ = mod->GetFunction("scatter_probs", true).value_or(Function(nullptr));
   this->gather_hidden_states_func_ = mod_get_func("gather_hidden_states");
   this->scatter_hidden_states_func_ = mod_get_func("scatter_hidden_states");
+  // DFlash speculative decoding functions (optional, only present in DFlash-compiled models).
+  this->prefill_with_hidden_states_func_ = mod_get_func("batch_prefill_with_hidden_states");
+  this->verify_with_hidden_states_func_ = mod_get_func("batch_verify_with_hidden_states");
+  this->project_target_hidden_func_ = mod_get_func("project_target_hidden");
+  this->dflash_draft_forward_func_ = mod_get_func("draft_forward");
 }
 
 ObjectRef FunctionTable::Empty(Shape shape, DataType dtype, Device device,

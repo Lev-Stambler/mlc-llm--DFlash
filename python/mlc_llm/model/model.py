@@ -15,6 +15,7 @@ from .chatglm3 import chatglm3_loader, chatglm3_model
 from .cohere import cohere_loader, cohere_model
 from .deepseek import deepseek_loader, deepseek_model
 from .deepseek_v2 import deepseek_v2_loader, deepseek_v2_model
+from .dflash import dflash_loader, dflash_model
 from .eagle import eagle_loader, eagle_model
 from .gemma import gemma_loader, gemma_model
 from .gemma2 import gemma2_loader, gemma2_model
@@ -509,6 +510,18 @@ MODELS: Dict[str, Model] = {
         quantize=make_quantization_functions(
             chatglm3_model.ChatGLMForCausalLM,
             supports_ft_quant=False,
+        ),
+    ),
+    "dflash": Model(
+        name="dflash",
+        model=dflash_model.DFlashDraftModel,
+        config=dflash_model.DFlashConfig,
+        source={
+            "huggingface-torch": dflash_loader.huggingface,
+            "huggingface-safetensor": dflash_loader.huggingface,
+        },
+        quantize=make_quantization_functions(
+            dflash_model.DFlashDraftModel,
         ),
     ),
     "eagle": Model(

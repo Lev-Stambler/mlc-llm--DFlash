@@ -56,6 +56,23 @@ Array<EngineAction> CreateEngineActions(Array<Model> models, EngineConfig engine
                  EngineAction::EagleBatchVerify(models, logit_processor, sampler, model_workspaces,
                                                 draft_token_workspace_manager, engine_config,
                                                 trace_recorder)};
+    } else if (engine_config->speculative_mode == SpeculativeMode::kDFlash) {
+      TVM_FFI_ICHECK_GT(engine_config->spec_draft_length, 0)
+          << "The automatic spec decoding does not support DFlash mode as of now.";
+      actions = {EngineAction::DFlashNewRequestPrefill(models,                         //
+                                                       logit_processor,                //
+                                                       sampler,                        //
+                                                       model_workspaces,               //
+                                                       draft_token_workspace_manager,  //
+                                                       engine_config,                  //
+                                                       model_configs,                  //
+                                                       trace_recorder),
+                 EngineAction::DFlashBatchDraft(models, logit_processor, sampler, model_workspaces,
+                                                draft_token_workspace_manager, engine_config,
+                                                trace_recorder),
+                 EngineAction::DFlashBatchVerify(models, logit_processor, sampler, model_workspaces,
+                                                 draft_token_workspace_manager, engine_config,
+                                                 trace_recorder)};
     } else if (engine_config->spec_draft_length > 0) {
       // The "small draft" mode speculative decoding.
       // If "engine_config->spec_draft_length" > 0, it means the draft length is
