@@ -134,37 +134,62 @@ class DFlashAttention(nn.Module):  # pylint: disable=too-many-instance-attribute
         k_draft = self.k_proj(hidden_states)
         v_draft = self.v_proj(hidden_states)
 
-        # Concatenate context + draft for K/V
-        k = op.concat([k_ctx, k_draft], dim=1)  # [b, kv_len+q_len, h_kv*d]
-        v = op.concat([v_ctx, v_draft], dim=1)
+        # Reshape and norm K before RoPE (apply to ctx and draft separately
+        # to avoid symbolic shape mismatch with cos/sin in TVM)
+        k_ctx = op.reshape(k_ctx, (b, kv_len, h_kv, d))
+        k_draft = op.reshape(k_draft, (b, q_len, h_kv, d))
+        k_ctx = self.k_norm(k_ctx)
+        k_draft = self.k_norm(k_draft)
 
-        total_kv = kv_len + q_len
-        k = op.reshape(k, (b, total_kv, h_kv, d))
-        v = op.reshape(v, (b, total_kv, h_kv, d))
-        k = self.k_norm(k)
+        # Apply RoPE separately: ctx uses positions 0..kv_len-1,
+        # draft uses positions kv_len..kv_len+q_len-1
+        ctx_pos = op.arange(0, kv_len, dtype="int32")
+        draft_pos = op.arange(kv_len, kv_len + q_len, dtype="int32")
 
-        # Apply RoPE - cos/sin shape: [b, total_kv, 1, d]
-        # q uses the last q_len positions
-        q_cos = op.take(cos, op.arange(kv_len, kv_len + q_len, dtype="int32"), axis=1)
-        q_sin = op.take(sin, op.arange(kv_len, kv_len + q_len, dtype="int32"), axis=1)
-        q = _apply_rope(q, q_cos, q_sin)
-        k = _apply_rope(k, cos, sin)
+        ctx_cos = op.take(cos, ctx_pos, axis=1)
+        ctx_sin = op.take(sin, ctx_pos, axis=1)
+        draft_cos = op.take(cos, draft_pos, axis=1)
+        draft_sin = op.take(sin, draft_pos, axis=1)
+
+        q = _apply_rope(q, draft_cos, draft_sin)
+        k_ctx = _apply_rope(k_ctx, ctx_cos, ctx_sin)
+        k_draft = _apply_rope(k_draft, draft_cos, draft_sin)
+
+        # Reshape V parts
+        v_ctx = op.reshape(v_ctx, (b, kv_len, h_kv, d))
+        v_draft = op.reshape(v_draft, (b, q_len, h_kv, d))
 
         # Transpose to [b, heads, seq, d]
         q = op.permute_dims(q, [0, 2, 1, 3])  # [b, h_q, q_len, d]
-        k = op.permute_dims(k, [0, 2, 1, 3])  # [b, h_kv, total_kv, d]
-        v = op.permute_dims(v, [0, 2, 1, 3])  # [b, h_kv, total_kv, d]
+        k_ctx = op.permute_dims(k_ctx, [0, 2, 1, 3])  # [b, h_kv, kv_len, d]
+        k_draft = op.permute_dims(k_draft, [0, 2, 1, 3])  # [b, h_kv, q_len, d]
+        v_ctx = op.permute_dims(v_ctx, [0, 2, 1, 3])
+        v_draft = op.permute_dims(v_draft, [0, 2, 1, 3])
 
         # GQA: repeat K/V heads
         if self.num_kv_groups > 1:
-            k = op.repeat(k, self.num_kv_groups, axis=1)
-            v = op.repeat(v, self.num_kv_groups, axis=1)
+            k_ctx = op.repeat(k_ctx, self.num_kv_groups, axis=1)
+            k_draft = op.repeat(k_draft, self.num_kv_groups, axis=1)
+            v_ctx = op.repeat(v_ctx, self.num_kv_groups, axis=1)
+            v_draft = op.repeat(v_draft, self.num_kv_groups, axis=1)
+
+        # Concatenate K and V for full attention
+        k = op.concat([k_ctx, k_draft], dim=2)  # [b, h_kv/h_q, kv_len+q_len, d]
+        v = op.concat([v_ctx, v_draft], dim=2)
 
         # Explicit attention: scores = Q @ K^T / sqrt(d)
-        scores = op.matmul(q, op.permute_dims(k, [0, 1, 3, 2]))
+        scores = op.matmul(q, op.permute_dims(k, [0, 1, 3, 2]))  # [b, h_q, q_len, kv_len+q_len]
         scores = scores * self.scaling
+
+        # Reshape scores so last dim matches attention_mask's "total_len" symbol
+        total_len = attention_mask.shape[3]
+        scores = op.reshape(scores, (b, self.num_q_heads, q_len, total_len))
+
         scores = scores + attention_mask.astype(scores.dtype)
         probs = op.softmax(scores, axis=-1)
+
+        # Reshape V to match scores' last dim for matmul
+        v = op.reshape(v, (b, self.num_q_heads, total_len, d))
         output = op.matmul(probs, v)  # [b, h_q, q_len, d]
 
         # Reshape back
@@ -175,12 +200,10 @@ class DFlashAttention(nn.Module):  # pylint: disable=too-many-instance-attribute
 
 def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     """Apply rotary position embeddings. x: [b, s, h, d], cos/sin: [b, s, 1, d]."""
-    # Cast cos/sin to match x dtype (they may be float32 from C++ construction)
     cos = cos.astype(x.dtype)
     sin = sin.astype(x.dtype)
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    rotated = op.concat([-x2, x1], dim=-1)
+    x1, x2 = op.split(x, 2, axis=-1)
+    rotated = op.concat([op.negative(x2), x1], dim=-1)
     return x * cos + rotated * sin
 
 

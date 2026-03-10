@@ -238,6 +238,70 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
   }
 
  private:
+  /*!
+   * \brief Match prefix cache for DFlash. Only operates on the target model (model 0)
+   * since the DFlash draft model is stateless and has no KV cache.
+   */
+  int MatchPrefixCache(EngineState estate, PrefillInput* input) final {
+    RequestStateEntry rsentry = input->rsentry;
+    if (estate->prefix_cache->Mode() == PrefixCacheMode::kDisable) {
+      return 0;
+    }
+    if (rsentry->parent_idx == -1 && rsentry->status == RequestStateStatus::kPending &&
+        !estate->prefix_cache->HasSequence(rsentry->mstates[0]->internal_id)) {
+      std::vector<int32_t> tokens = GetConcatPrefillInputData(rsentry->mstates[0]);
+      if (tokens.empty()) {
+        return 0;
+      }
+      PrefixCacheMatchedResult result = estate->prefix_cache->InsertSequence(
+          rsentry->mstates[0]->internal_id, tokens, models_[0]->GetSlidingWindowSize(),
+          models_[0]->GetAttentionSinkSize());
+
+      if (result.prefilled_offset == 0) {
+        // Add new sequence — only for target model (model 0)
+        TVM_FFI_ICHECK_EQ(result.forked_seq_id, -1);
+        TVM_FFI_ICHECK_EQ(result.reused_seq_id, -1);
+        TVM_FFI_ICHECK_EQ(result.reused_seq_pop_last_tokens, 0);
+        models_[0]->AddNewSequence(rsentry->mstates[0]->internal_id);
+        if (rsentry->child_indices.empty()) {
+          models_[0]->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);
+        }
+      } else {
+        if (result.forked_seq_id != -1) {
+          TVM_FFI_ICHECK_EQ(result.reused_seq_id, -1);
+          TVM_FFI_ICHECK_EQ(result.reused_seq_pop_last_tokens, 0);
+          // Fork from active sequence — only target model
+          models_[0]->ForkSequence(result.forked_seq_id, rsentry->mstates[0]->internal_id,
+                                   result.prefilled_offset);
+          if (rsentry->child_indices.empty()) {
+            models_[0]->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);
+          }
+        } else {
+          // Reuse recycling sequence
+          TVM_FFI_ICHECK_EQ(result.forked_seq_id, -1);
+          estate->id_manager.RecycleId(rsentry->mstates[0]->internal_id);
+          for (int i = 0; i < rsentry->mstates.size(); ++i) {
+            rsentry->mstates[i]->internal_id = result.reused_seq_id;
+          }
+          if (result.reused_seq_pop_last_tokens > 0) {
+            models_[0]->PopNFromKVCache(rsentry->mstates[0]->internal_id,
+                                         result.reused_seq_pop_last_tokens);
+          }
+        }
+      }
+      // Pop matched prefix
+      if (result.prefilled_offset) {
+        for (int i = 0; i < rsentry->mstates.size(); ++i) {
+          PopPrefillInputData(rsentry->mstates[i], result.prefilled_offset);
+        }
+      }
+      input->max_prefill_length =
+          std::min(input->max_prefill_length, rsentry->mstates[0]->GetInputLength());
+      return result.prefilled_offset;
+    }
+    return 0;
+  }
+
   /*! \brief The logit processor. */
   LogitProcessor logit_processor_;
   /*! \brief The sampler to sample new tokens. */
