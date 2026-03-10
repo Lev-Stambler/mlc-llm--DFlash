@@ -136,7 +136,7 @@ MODEL                  The model folder after compiling with MLC-LLM build proce
 
                        When the model lib of a model is not given, JIT model compilation will be activated
                        to compile the model automatically.
---speculative-mode     The speculative decoding mode. Right now four options are supported:
+--speculative-mode     The speculative decoding mode. Right now five options are supported:
 
                        - ``disable``, where speculative decoding is not enabled,
 
@@ -145,6 +145,8 @@ MODEL                  The model folder after compiling with MLC-LLM build proce
                        - ``eagle``, denoting the eagle-style speculative decoding.
 
                        - ``medusa``, denoting the medusa-style speculative decoding.
+
+                       - ``dflash``, denoting the DFlash block-diffusion speculative decoding.
 --overrides            Overriding extra configurable fields of EngineConfig.
 
                        Supporting fields that can be be overridden: ``tensor_parallel_shards``, ``max_num_sequence``,
