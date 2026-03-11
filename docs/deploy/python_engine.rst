@@ -229,6 +229,30 @@ In short,
 Please refer to :ref:`python-engine-api-reference` for detailed documentation of the engine mode.
 
 
+Speculative Decoding
+--------------------
+
+MLC LLM supports speculative decoding with modes ``small_draft``, ``eagle``, ``medusa``, and ``dflash``.
+To enable speculative decoding, configure ``speculative_mode`` and ``additional_models`` in :class:`~mlc_llm.serve.config.EngineConfig`:
+
+.. code:: python
+
+  from mlc_llm import MLCEngine
+  from mlc_llm.serve.config import EngineConfig
+
+  model = "dist/Qwen3-8B-q4f16_1-MLC"
+  engine = MLCEngine(
+      model,
+      engine_config=EngineConfig(
+          speculative_mode="eagle",
+          additional_models=["dist/Eagle-Qwen3-8B-MLC"],
+          spec_draft_length=4,
+      ),
+  )
+
+For DFlash mode, use ``speculative_mode="dflash"`` with a DFlash draft model (``model_type: "dflash"`` in its config).
+
+
 Deploy Your Own Model with Python API
 -------------------------------------
 

@@ -147,6 +147,7 @@ MODEL                  The model folder after compiling with MLC-LLM build proce
                        - ``medusa``, denoting the medusa-style speculative decoding.
 
                        - ``dflash``, denoting the DFlash block-diffusion speculative decoding.
+                         DFlash requires a separate draft model with ``model_type: "dflash"`` in its config.
 --overrides            Overriding extra configurable fields of EngineConfig.
 
                        Supporting fields that can be be overridden: ``tensor_parallel_shards``, ``max_num_sequence``,

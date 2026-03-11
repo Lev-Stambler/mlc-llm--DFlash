@@ -205,11 +205,12 @@ Under mode "local" or "interactive", the actual memory usage may be significantl
 this number. Under mode "server", the actual memory usage may be slightly larger than this number.
 """.strip(),
     "speculative_mode_serve": """
-The speculative decoding mode. Right now four options are supported:
+The speculative decoding mode. Right now five options are supported:
  - "disable", where speculative decoding is not enabled,
  - "small_draft", denoting the normal speculative decoding (small draft) style,
  - "eagle", denoting the eagle-style speculative decoding.
  - "medusa", denoting the medusa-style speculative decoding.
+ - "dflash", denoting the DFlash block-diffusion speculative decoding.
 The default mode is "disable".
 """.strip(),
     "spec_draft_length_serve": """

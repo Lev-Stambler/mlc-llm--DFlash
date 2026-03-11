@@ -69,7 +69,7 @@ We provide the list of chat CLI interface for reference.
 
 .. code:: bash
 
-   mlc_llm chat MODEL [--model-lib PATH-TO-MODEL-LIB] [--device DEVICE] [--overrides OVERRIDES]
+   mlc_llm chat MODEL [--model-lib PATH-TO-MODEL-LIB] [--device DEVICE] [--overrides OVERRIDES] [--speculative-mode MODE] [--additional-models MODELS] [--spec-draft-length LENGTH]
 
 
 MODEL                  The model folder after compiling with MLC-LLM build process. The parameter
@@ -88,3 +88,13 @@ MODEL                  The model folder after compiling with MLC-LLM build proce
                        ``context_window_size``, ``prefill_chunk_size``, ``sliding_window_size``, ``attention_sink_size``,
                        and ``tensor_parallel_shards``. The overrides could be explicitly
                        specified via details knobs, e.g. --overrides ``context_window_size=1024;prefill_chunk_size=128``.
+--speculative-mode     The speculative decoding mode. Supported options:
+
+                       - ``disable`` (default): speculative decoding is not enabled.
+                       - ``small_draft``: normal speculative decoding with a small draft model.
+                       - ``eagle``: eagle-style speculative decoding.
+                       - ``medusa``: medusa-style speculative decoding.
+                       - ``dflash``: DFlash block-diffusion speculative decoding.
+--additional-models    The model path and (optional) model library path of the draft model for
+                       speculative decoding. Specify as ``model_path`` or ``model_path,model_lib_path``.
+--spec-draft-length    The number of draft tokens to generate in speculative proposal. Default is 4.

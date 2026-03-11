@@ -100,7 +100,7 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     kv_state_kind: Optional[Literal["kv_cache", "rnn_state"]]
         The kind of cache.
 
-    speculative_mode : Literal["disable", "small_draft", "eagle", "medusa"]
+    speculative_mode : Literal["disable", "small_draft", "eagle", "medusa", "dflash"]
         The speculative mode.
         "disable" means speculative decoding is disabled.
         "small_draft" means the normal speculative decoding (small draft) mode.
