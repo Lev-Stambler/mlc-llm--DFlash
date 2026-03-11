@@ -76,7 +76,9 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
       request_internal_ids.push_back(rsentry->mstates[0]->internal_id);
       generation_cfg.push_back(rsentry->request->generation_cfg);
       rngs.push_back(&rsentry->rng);
-      mstates.push_back(rsentry->mstates[0]);
+      // Use draft model's mstate (model 1) for draft token tracking,
+      // consistent with verify which reads from mstates[draft_model_id_].
+      mstates.push_back(rsentry->mstates[1]);
     }
 
     int block_size = estate->spec_draft_length;

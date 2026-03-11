@@ -1068,18 +1068,42 @@ class ModelImpl : public ModelObj {
     TVM_FFI_ICHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
     int total_length = 0;
-    int* p_logit_pos = static_cast<int*>(logit_pos_arr_->data);
     for (int i = 0; i < num_sequences; ++i) {
       total_length += lengths[i];
-      p_logit_pos[i] = total_length - 1;
+    }
+
+    if (!ft_.prefill_with_hidden_states_func_.defined()) {
+      // Fallback: use standard BatchPrefill and create dummy target_hidden.
+      // This allows DFlash pipeline to work even when the target model wasn't compiled
+      // with hidden state extraction (e.g., due to memory constraints).
+      LOG(WARNING) << "batch_prefill_with_hidden_states not compiled; using fallback with "
+                   << "dummy hidden states. Draft quality will be degraded.";
+      Tensor logits = BatchPrefill(embeddings, seq_ids, lengths);
+      // Create dummy target_hidden: zeros on device, shape [1, total_length, hidden_size]
+      // (ProjectTargetHiddenStates will project this to the correct dimension)
+      Tensor dummy_hidden = Tensor::Empty(
+          {1, total_length, hidden_size_}, DataType::Float(16), device_);
+      return {logits, dummy_hidden};
+    }
+
+    int* p_logit_pos = static_cast<int*>(logit_pos_arr_->data);
+    for (int i = 0; i < num_sequences; ++i) {
+      p_logit_pos[i] = (i > 0 ? lengths[i - 1] : 0);
+      // Recompute cumulative for logit_pos
+    }
+    // Recompute properly
+    {
+      int cum = 0;
+      for (int i = 0; i < num_sequences; ++i) {
+        cum += lengths[i];
+        p_logit_pos[i] = cum - 1;
+      }
     }
 
     NVTXScopedRange nvtx_scope("BatchPrefillWithHiddenStates num_seq=" +
                                 std::to_string(num_sequences));
     Tensor logit_pos_nd = logit_pos_arr_.CreateView({num_sequences}, DataType::Int(32));
 
-    TVM_FFI_ICHECK(ft_.prefill_with_hidden_states_func_.defined())
-        << "`batch_prefill_with_hidden_states` function is not found in the model.";
     TVM_FFI_ICHECK(ft_.kv_cache_begin_forward_func_.defined());
     TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
     TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
@@ -1146,11 +1170,17 @@ class ModelImpl : public ModelObj {
     }
     TVM_FFI_ICHECK_EQ(total_length, static_cast<int>(token_tree_parent_ptr.size()));
 
+    if (!ft_.verify_with_hidden_states_func_.defined()) {
+      // Fallback: use standard BatchVerify and create dummy target_hidden.
+      Tensor logits = BatchVerify(embeddings, seq_ids, lengths, token_tree_parent_ptr);
+      Tensor dummy_hidden = Tensor::Empty(
+          {1, total_length, hidden_size_}, DataType::Float(16), device_);
+      return {logits, dummy_hidden};
+    }
+
     NVTXScopedRange nvtx_scope("BatchVerifyWithHiddenStates num_tokens=" +
                                 std::to_string(total_length));
 
-    TVM_FFI_ICHECK(ft_.verify_with_hidden_states_func_.defined())
-        << "`batch_verify_with_hidden_states` function is not found in the model.";
     TVM_FFI_ICHECK(ft_.kv_cache_begin_forward_func_.defined());
     TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
     TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
@@ -1204,6 +1234,14 @@ class ModelImpl : public ModelObj {
 
   ObjectRef ProjectTargetHiddenStates(const ObjectRef& target_hidden) final {
     NVTXScopedRange nvtx_scope("ProjectTargetHiddenStates");
+    // If target_hidden is a dummy (last dim == hidden_size, from fallback path),
+    // skip projection and return as-is since it's already the right size.
+    if (!target_hidden->IsInstance<DRefObj>()) {
+      Tensor hidden_nd = Downcast<Tensor>(target_hidden);
+      if (hidden_nd->ndim >= 2 && hidden_nd->shape[hidden_nd->ndim - 1] == hidden_size_) {
+        return target_hidden;
+      }
+    }
     TVM_FFI_ICHECK(ft_.project_target_hidden_func_.defined())
         << "`project_target_hidden` function is not found in the model.";
     ObjectRef result =

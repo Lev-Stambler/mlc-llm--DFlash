@@ -386,12 +386,16 @@ class Qwen3LMHeadModel(nn.Module):  # pylint: disable=too-many-instance-attribut
         logit_positions: Tensor,
         paged_kv_cache: PagedKVCache,
     ):
-        """Prefill that returns (logits, intermediate_hidden_states, kv_cache)."""
+        """Prefill that returns (logits, target_hidden, kv_cache).
+        Uses last hidden state replicated for all target layers to avoid OOM during compilation
+        (forward_with_hidden_states keeps 5 intermediate tensors alive across all 36 layers)."""
         op_ext.configure()
         if self.tensor_parallel_shards > 1:
             logit_positions = op.ccl_broadcast_from_worker0(logit_positions)
-        hidden_states, target_hidden = self.model.forward_with_hidden_states(
-            input_embeds, paged_kv_cache, self._dflash_target_layer_ids
+        hidden_states = self.model(input_embeds, paged_kv_cache)
+        # Replicate last hidden state for all target layers
+        target_hidden = op.concat(
+            [hidden_states] * self._dflash_num_target_layers, dim=-1
         )
         hidden_states_at_logits = op.take(hidden_states, logit_positions, axis=1)
         if self.tie_word_embeddings:
@@ -407,10 +411,12 @@ class Qwen3LMHeadModel(nn.Module):  # pylint: disable=too-many-instance-attribut
         input_embeds: Tensor,
         paged_kv_cache: PagedKVCache,
     ):
-        """Verify that returns (logits, intermediate_hidden_states, kv_cache)."""
+        """Verify that returns (logits, target_hidden, kv_cache).
+        Uses last hidden state replicated for all target layers."""
         op_ext.configure()
-        hidden_states, target_hidden = self.model.forward_with_hidden_states(
-            input_embeds, paged_kv_cache, self._dflash_target_layer_ids
+        hidden_states = self.model(input_embeds, paged_kv_cache)
+        target_hidden = op.concat(
+            [hidden_states] * self._dflash_num_target_layers, dim=-1
         )
         if self.tie_word_embeddings:
             logits = self.model.embed_tokens.lm_head_forward(hidden_states)

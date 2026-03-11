@@ -50,7 +50,7 @@ def huggingface(model_config: DFlashConfig, quantization: Quantization) -> Exter
                 mlc_param = named_parameters[mlc_name]
                 mapping.add_mapping(
                     mlc_name,
-                    [f"model.{attn}.{proj}.weight"],
+                    [f"{attn}.{proj}.weight"],
                     functools.partial(
                         lambda x, dtype: x.astype(dtype), dtype=mlc_param.dtype
                     ),
@@ -64,8 +64,8 @@ def huggingface(model_config: DFlashConfig, quantization: Quantization) -> Exter
             mapping.add_mapping(
                 mlc_gate_up_name,
                 [
-                    f"model.{mlp}.gate_proj.weight",
-                    f"model.{mlp}.up_proj.weight",
+                    f"{mlp}.gate_proj.weight",
+                    f"{mlp}.up_proj.weight",
                 ],
                 functools.partial(
                     lambda gate, up, dtype: np.concatenate([gate, up], axis=0).astype(
@@ -76,19 +76,17 @@ def huggingface(model_config: DFlashConfig, quantization: Quantization) -> Exter
             )
 
         # Mark rotary_emb.inv_freq as unused
-        mapping.add_unused(f"model.{attn}.rotary_emb.inv_freq")
+        mapping.add_unused(f"{attn}.rotary_emb.inv_freq")
 
     # Mark top-level rotary_emb as unused
-    mapping.add_unused("model.rotary_emb.inv_freq")
+    mapping.add_unused("rotary_emb.inv_freq")
 
-    # Map remaining parameters with model. prefix
+    # Map remaining parameters directly (HF names match MLC names for DFlash)
     for mlc_name, mlc_param in named_parameters.items():
         if mlc_name not in mapping.param_map:
-            # MLC names don't have "model." prefix, HF names do
-            hf_name = f"model.{mlc_name}"
             mapping.add_mapping(
                 mlc_name,
-                [hf_name],
+                [mlc_name],
                 functools.partial(
                     lambda x, dtype: x.astype(dtype), dtype=mlc_param.dtype
                 ),
