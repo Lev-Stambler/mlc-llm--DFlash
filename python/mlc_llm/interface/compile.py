@@ -131,6 +131,8 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
     logger.info("TOP LEVEL MODEL CONFIG BEFORE OVERRIDES: %s", str(model_config))
     _kwargs = getattr(model_config, "kwargs", {})
     model_config = args.overrides.apply(model_config)
+    # Restore kwargs that were stripped by overrides.apply (asdict pops kwargs)
+    model_config.kwargs.update(_kwargs)
     with args.target:
         op_ext.enable(
             target=args.target,

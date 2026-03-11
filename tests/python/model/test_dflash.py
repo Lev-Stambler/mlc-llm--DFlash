@@ -5,6 +5,7 @@ import pytest
 
 from mlc_llm.model import MODEL_PRESETS, MODELS
 from mlc_llm.model.dflash.dflash_model import DFlashConfig
+from mlc_llm.model.qwen3.qwen3_model import Qwen3Config, Qwen3LMHeadModel
 from mlc_llm.serve.config import EngineConfig
 
 
@@ -117,6 +118,32 @@ def test_dflash_speculative_mode_accepted():
     """Verify EngineConfig accepts speculative_mode='dflash' without raising."""
     engine_config = EngineConfig(speculative_mode="dflash")
     assert engine_config.speculative_mode == "dflash"
+
+
+def test_qwen3_dflash_target_layers_must_be_sorted():
+    """DFlash target-layer extraction relies on ascending layer ids."""
+
+    config = Qwen3Config.from_dict(
+        {
+            "hidden_act": "silu",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "attention_bias": False,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000,
+            "vocab_size": 32000,
+            "tie_word_embeddings": True,
+            "head_dim": 32,
+            "max_position_embeddings": 128,
+            "dflash_target_layer_ids": [2, 0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="ascending order"):
+        Qwen3LMHeadModel(config)
 
 
 if __name__ == "__main__":

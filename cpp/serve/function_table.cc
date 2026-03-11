@@ -290,6 +290,7 @@ void FunctionTable::_InitFunctions() {
   this->gather_hidden_states_func_ = mod_get_func("gather_hidden_states");
   this->scatter_hidden_states_func_ = mod_get_func("scatter_hidden_states");
   // DFlash speculative decoding functions (optional, only present in DFlash-compiled models).
+  this->decode_with_hidden_states_func_ = mod_get_func("batch_decode_with_hidden_states");
   this->prefill_with_hidden_states_func_ = mod_get_func("batch_prefill_with_hidden_states");
   this->verify_with_hidden_states_func_ = mod_get_func("batch_verify_with_hidden_states");
   this->project_target_hidden_func_ = mod_get_func("project_target_hidden");

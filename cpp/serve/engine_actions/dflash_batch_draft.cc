@@ -6,8 +6,9 @@
  *  in a single forward pass through the lightweight draft model.
  */
 
+#include <tvm/runtime/device_api.h>
+
 #include <cmath>
-#include <cstring>
 #include <numeric>
 
 #include "../config.h"
@@ -15,6 +16,7 @@
 #include "../sampler/sampler.h"
 #include "action.h"
 #include "action_commons.h"
+#include "dflash_commons.h"
 
 namespace mlc {
 namespace llm {
@@ -92,12 +94,12 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
         int64_t internal_id = request_internal_ids[req_idx];
 
         // Check that projected_target_hidden exists for this request.
-        auto it = model_workspaces_[0].dflash_projected_target_hidden.find(internal_id);
-        if (it == model_workspaces_[0].dflash_projected_target_hidden.end()) {
-          // No projected hidden available — skip draft for this request.
+        auto& pth_map = *model_workspaces_[0].dflash_projected_target_hidden;
+        auto it = pth_map.find(internal_id);
+        if (it == pth_map.end()) {
           continue;
         }
-        ObjectRef projected_target_hidden = it->second;
+        Tensor projected_target_hidden = it->second.View();
 
         // TODO(dflash): Read mask_token_id from DFlash model config.
         int mask_token_id = 151669;  // Default for Qwen3-8B-DFlash-b16
@@ -126,20 +128,18 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
             embed_nd.CreateView({1, block_size, hidden_size}, embed_nd->dtype);
 
         // 2. Determine context length from projected_target_hidden shape.
-        Tensor proj_nd = Downcast<Tensor>(projected_target_hidden);
-        int ctx_len = proj_nd->shape[1];  // [1, ctx_len, hidden_size]
+        int ctx_len = projected_target_hidden->shape[1];
         int total_len = ctx_len + block_size;
 
         // 3. Construct RoPE cos/sin and attention mask.
-        RECORD_EVENT(trace_recorder_, request_ids, "start dflash rope construction");
-        auto [cos_tensor, sin_tensor] = ConstructRoPEEmbeddings(total_len);
-        RECORD_EVENT(trace_recorder_, request_ids, "finish dflash rope construction");
-        Tensor mask_tensor = ConstructZeroMask(block_size, total_len);
+        const DFlashDraftAuxTensors& aux_tensors =
+            GetDraftAuxTensors(total_len, projected_target_hidden->device);
 
         // 4. DFlash draft forward (single-pass through stateless draft model).
         RECORD_EVENT(trace_recorder_, request_ids, "start dflash draft forward");
         ObjectRef draft_hidden = models_[1]->DFlashDraftForward(
-            reshaped_embedding, projected_target_hidden, cos_tensor, sin_tensor, mask_tensor);
+            reshaped_embedding, projected_target_hidden, aux_tensors.cos, aux_tensors.sin,
+            aux_tensors.mask);
         RECORD_EVENT(trace_recorder_, request_ids, "finish dflash draft forward");
 
         // 5. Get logits via target model's LM head (shared).
@@ -148,7 +148,8 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
         Tensor reshaped_hidden =
             draft_hidden_nd.CreateView({block_size, hidden_size}, draft_hidden_nd->dtype);
         Tensor logits;
-        if (models_[1]->CanGetLogits()) {
+        bool use_draft_logits = models_[1]->CanGetLogits();
+        if (use_draft_logits) {
           logits = models_[1]->GetLogits(reshaped_hidden);
         } else {
           logits = models_[0]->GetLogits(reshaped_hidden);
@@ -176,41 +177,53 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
         // DFlash block diffusion generates all positions simultaneously — no sequential
         // draft token penalty needed. Pass nullptr for draft_mstates/draft_token_indices.
         logit_processor_->InplaceUpdateLogits(logits, rep_gen_cfg, rep_mstates, rep_request_ids);
-        Tensor probs_on_device = logit_processor_->ComputeProbsFromLogits(
-            logits, rep_gen_cfg, rep_request_ids);
-
         // 7. Sample from positions 1..block_size-1 (skip position 0 = committed token).
         int num_draft = block_size - 1;
-        std::vector<int> sample_indices;
-        Array<String> sample_request_ids;
-        Array<GenerationConfig> sample_gen_cfg;
-        std::vector<RandomGenerator*> sample_rngs;
-        sample_indices.reserve(num_draft);
-        sample_request_ids.reserve(num_draft);
-        sample_gen_cfg.reserve(num_draft);
-        sample_rngs.reserve(num_draft);
-        for (int d = 0; d < num_draft; ++d) {
-          sample_indices.push_back(d + 1);  // Row d+1 in probs tensor
-          sample_request_ids.push_back(request_ids[req_idx]);
-          sample_gen_cfg.push_back(generation_cfg[req_idx]);
-          sample_rngs.push_back(rngs[req_idx]);
-        }
+        bool deterministic_generation = IsDeterministicGenerationConfig(generation_cfg[req_idx]);
+        Tensor probs_on_device{nullptr};
+        std::vector<SampleResult> sample_results;
+        if (deterministic_generation) {
+          Tensor logits_on_host = CopyTensorToCPU(logits);
+          sample_results.reserve(num_draft);
+          for (int d = 0; d < num_draft; ++d) {
+            sample_results.push_back(
+                SampleResult{{ArgmaxTokenId(logits_on_host, d + 1), 1.0f}, {}});
+          }
+        } else {
+          probs_on_device = logit_processor_->ComputeProbsFromLogits(logits, rep_gen_cfg,
+                                                                     rep_request_ids);
+          std::vector<int> sample_indices;
+          Array<String> sample_request_ids;
+          Array<GenerationConfig> sample_gen_cfg;
+          std::vector<RandomGenerator*> sample_rngs;
+          sample_indices.reserve(num_draft);
+          sample_request_ids.reserve(num_draft);
+          sample_gen_cfg.reserve(num_draft);
+          sample_rngs.reserve(num_draft);
+          for (int d = 0; d < num_draft; ++d) {
+            sample_indices.push_back(d + 1);  // Row d+1 in probs tensor
+            sample_request_ids.push_back(request_ids[req_idx]);
+            sample_gen_cfg.push_back(generation_cfg[req_idx]);
+            sample_rngs.push_back(rngs[req_idx]);
+          }
 
-        Tensor renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
-            probs_on_device, sample_indices, sample_request_ids, sample_gen_cfg);
-        std::vector<SampleResult> sample_results =
-            sampler_->BatchSampleTokensWithProbAfterTopP(renormalized_probs, sample_indices,
-                                                          sample_request_ids, sample_gen_cfg,
-                                                          sample_rngs);
-        TVM_FFI_ICHECK_EQ(static_cast<int>(sample_results.size()), num_draft);
+          Tensor renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
+              probs_on_device, sample_indices, sample_request_ids, sample_gen_cfg);
+          sample_results = sampler_->BatchSampleTokensWithProbAfterTopP(
+              renormalized_probs, sample_indices, sample_request_ids, sample_gen_cfg,
+              sample_rngs);
+          TVM_FFI_ICHECK_EQ(static_cast<int>(sample_results.size()), num_draft);
+        }
 
         // 8. Store draft probs and add draft tokens.
         // Allocate block_size slots so ScatterDraftProbs can scatter all rows.
         // Then free slot 0 (committed token position, not used as draft).
         draft_token_slots_.clear();
         draft_token_workspace_manager_->AllocSlots(block_size, &draft_token_slots_);
-        models_[0]->ScatterDraftProbs(probs_on_device, draft_token_slots_,
-                                       &model_workspaces_[0].draft_probs_storage);
+        if (!deterministic_generation) {
+          models_[0]->ScatterDraftProbs(probs_on_device, draft_token_slots_,
+                                         &model_workspaces_[0].draft_probs_storage);
+        }
         // Free unused slot for position 0 (committed token's logit row).
         std::vector<int> unused_slots = {draft_token_slots_[0]};
         draft_token_workspace_manager_->FreeSlots(unused_slots);
@@ -241,12 +254,7 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
     return num_rsentries <= num_available_pages;
   }
 
-  /*!
-   * \brief Construct RoPE cos/sin embeddings for positions [0, total_len).
-   * Returns float32 tensors of shape [1, total_len, 1, head_dim] on CPU.
-   * The TVM compiled function handles device transfer.
-   */
-  std::pair<Tensor, Tensor> ConstructRoPEEmbeddings(int total_len) {
+  DFlashDraftAuxTensors CreateDraftAuxTensors(int total_len, int block_size, DLDevice device) {
     // TODO(dflash): Read head_dim and rope_theta from model config dynamically.
     int head_dim = 128;           // Default for Qwen3-8B-DFlash
     double rope_theta = 1000000.0;  // Default for Qwen3
@@ -271,30 +279,32 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
       }
     }
 
-    Device cpu_device{kDLCPU, 0};
     Shape shape{1, total_len, 1, head_dim};
-    Tensor cos_cpu = Tensor::Empty(shape, DataType::Float(32), cpu_device);
-    Tensor sin_cpu = Tensor::Empty(shape, DataType::Float(32), cpu_device);
-    cos_cpu.CopyFromBytes(cos_data.data(), cos_data.size() * sizeof(float));
-    sin_cpu.CopyFromBytes(sin_data.data(), sin_data.size() * sizeof(float));
+    Tensor cos = Tensor::Empty(shape, DataType::Float(32), device);
+    Tensor sin = Tensor::Empty(shape, DataType::Float(32), device);
+    cos.CopyFromBytes(cos_data.data(), cos_data.size() * sizeof(float));
+    sin.CopyFromBytes(sin_data.data(), sin_data.size() * sizeof(float));
 
-    // TODO(dflash): Cache and reuse RoPE tensors for common lengths.
-    return {cos_cpu, sin_cpu};
-  }
-
-  /*!
-   * \brief Construct a zero attention mask tensor.
-   * Shape: [1, 1, block_size, total_len], dtype: float32.
-   * All zeros means fully non-causal attention (attend to everything).
-   */
-  Tensor ConstructZeroMask(int block_size, int total_len) {
-    Device cpu_device{kDLCPU, 0};
-    Shape shape{1, 1, block_size, total_len};
-    Tensor mask = Tensor::Empty(shape, DataType::Float(32), cpu_device);
+    Shape mask_shape({1, 1, block_size, total_len});
+    Tensor mask = Tensor::Empty(mask_shape, DataType::Float(32), device);
     size_t num_bytes = block_size * total_len * sizeof(float);
     std::vector<char> zeros(num_bytes, 0);
     mask.CopyFromBytes(zeros.data(), num_bytes);
-    return mask;
+    // Ensure async host-to-device copies complete before local buffers are freed.
+    tvm::runtime::DeviceAPI::Get(device)->StreamSync(device, nullptr);
+    return {cos, sin, mask};
+  }
+
+  const DFlashDraftAuxTensors& GetDraftAuxTensors(int total_len, DLDevice device) {
+    auto& aux_cache = *model_workspaces_[0].dflash_draft_aux_tensors;
+    auto it = aux_cache.find(total_len);
+    if (it == aux_cache.end()) {
+      it = aux_cache
+               .emplace(total_len,
+                        CreateDraftAuxTensors(total_len, engine_config_->spec_draft_length, device))
+               .first;
+    }
+    return it->second;
   }
 
   Array<Model> models_;

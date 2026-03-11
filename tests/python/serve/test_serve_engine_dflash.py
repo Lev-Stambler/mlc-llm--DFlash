@@ -27,6 +27,11 @@ prompts = [
     "Do you know AlphaGo? What capabilities does it have, and what achievements has it got? Please elaborate in detail.",
 ]
 
+DFLASH_SMALL_MODEL = "dist/Qwen3-8B-DFlash-b16-q0f16-MLC"
+DFLASH_SMALL_MODEL_LIB = (
+    "dist/Qwen3-8B-DFlash-b16-q0f16-MLC/Qwen3-8B-DFlash-b16-q0f16-MLC-cuda.so"
+)
+
 
 def create_requests(
     num_requests: int,
@@ -57,6 +62,23 @@ def create_requests(
     return requests
 
 
+def create_dflash_engine(
+    model: str,
+    request_stream_callback: Optional[Callable[[List[RequestStreamOutput]], None]] = None,
+) -> SyncMLCEngine:
+    return SyncMLCEngine(
+        model=model,
+        mode="server",
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[(DFLASH_SMALL_MODEL, DFLASH_SMALL_MODEL_LIB)],
+            speculative_mode="dflash",
+            spec_draft_length=16,
+        ),
+        request_stream_callback=request_stream_callback,
+    )
+
+
 @require_test_model("Qwen3-8B-q0f16-MLC")
 def test_engine_dflash_basic(model: str):
     """Test DFlash engine without continuous batching.
@@ -80,22 +102,7 @@ def test_engine_dflash_basic(model: str):
             assert len(stream_outputs) == 1
             outputs[int(request_id)] += stream_outputs[0].delta_token_ids
 
-    # DFlash draft model paths (adjust to match your compiled model layout)
-    small_model = "dist/Qwen3-8B-DFlash-b16-q0f16-MLC"
-    small_model_lib = (
-        "dist/Qwen3-8B-DFlash-b16-q0f16-MLC/Qwen3-8B-DFlash-b16-q0f16-MLC-cuda.so"
-    )
-    engine = SyncMLCEngine(
-        model=model,
-        mode="server",
-        engine_config=EngineConfig(
-            max_total_sequence_length=4096,
-            additional_models=[(small_model, small_model_lib)],
-            speculative_mode="dflash",
-            spec_draft_length=16,
-        ),
-        request_stream_callback=fcallback,
-    )
+    engine = create_dflash_engine(model, request_stream_callback=fcallback)
 
     requests = create_requests(
         num_requests,
@@ -153,22 +160,8 @@ def test_engine_dflash_continuous_batching(model: str):
         def step(self) -> None:
             self.timer += 1
 
-    small_model = "dist/Qwen3-8B-DFlash-b16-q0f16-MLC"
-    small_model_lib = (
-        "dist/Qwen3-8B-DFlash-b16-q0f16-MLC/Qwen3-8B-DFlash-b16-q0f16-MLC-cuda.so"
-    )
     timer = CallbackTimer()
-    engine = SyncMLCEngine(
-        model=model,
-        mode="server",
-        engine_config=EngineConfig(
-            max_total_sequence_length=4096,
-            additional_models=[(small_model, small_model_lib)],
-            speculative_mode="dflash",
-            spec_draft_length=16,
-        ),
-        request_stream_callback=timer.callback_getter(),
-    )
+    engine = create_dflash_engine(model, request_stream_callback=timer.callback_getter())
 
     requests = create_requests(
         num_requests,
@@ -196,20 +189,7 @@ def test_engine_dflash_continuous_batching(model: str):
 def test_engine_dflash_generate(model: str):
     """Test DFlash engine using the high-level .generate() API."""
 
-    small_model = "dist/Qwen3-8B-DFlash-b16-q0f16-MLC"
-    small_model_lib = (
-        "dist/Qwen3-8B-DFlash-b16-q0f16-MLC/Qwen3-8B-DFlash-b16-q0f16-MLC-cuda.so"
-    )
-    engine = SyncMLCEngine(
-        model=model,
-        mode="server",
-        engine_config=EngineConfig(
-            max_total_sequence_length=4096,
-            additional_models=[(small_model, small_model_lib)],
-            speculative_mode="dflash",
-            spec_draft_length=16,
-        ),
-    )
+    engine = create_dflash_engine(model)
 
     num_requests = 10
     max_tokens = 256
@@ -244,21 +224,7 @@ def test_engine_dflash_spec_efficiency(model: str):
             assert len(stream_outputs) == 1
             outputs[int(request_id)] += stream_outputs[0].delta_token_ids
 
-    small_model = "dist/Qwen3-8B-DFlash-b16-q0f16-MLC"
-    small_model_lib = (
-        "dist/Qwen3-8B-DFlash-b16-q0f16-MLC/Qwen3-8B-DFlash-b16-q0f16-MLC-cuda.so"
-    )
-    spec_engine = SyncMLCEngine(
-        model=model,
-        mode="server",
-        engine_config=EngineConfig(
-            max_total_sequence_length=4096,
-            additional_models=[(small_model, small_model_lib)],
-            spec_draft_length=16,
-            speculative_mode="dflash",
-        ),
-        request_stream_callback=fcallback,
-    )
+    spec_engine = create_dflash_engine(model, request_stream_callback=fcallback)
 
     requests = create_requests(
         num_requests,
@@ -291,6 +257,32 @@ def test_engine_dflash_spec_efficiency(model: str):
             )
         print("engine total decode time:", metrics["engine_decode_time_sum"])
         print()
+
+
+@require_test_model("Qwen3-8B-q0f16-MLC")
+def test_engine_dflash_greedy_matches_disable(model: str):
+    """DFlash should exactly match normal decoding under deterministic settings."""
+
+    prompt = "Explain how photosynthesis works."
+    generation_config = GenerationConfig(
+        temperature=0.0,
+        top_p=1.0,
+        repetition_penalty=1.0,
+        max_tokens=64,
+        seed=0,
+    )
+
+    base_engine = SyncMLCEngine(
+        model=model,
+        mode="server",
+        engine_config=EngineConfig(max_total_sequence_length=4096),
+    )
+    dflash_engine = create_dflash_engine(model)
+
+    base_output, _ = base_engine.generate([prompt], generation_config)
+    dflash_output, _ = dflash_engine.generate([prompt], generation_config)
+
+    assert base_output == dflash_output
 
 
 if __name__ == "__main__":

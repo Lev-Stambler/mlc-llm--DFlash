@@ -7,6 +7,7 @@
 
 #include "../sampler/sampler.h"
 #include "batch_prefill_base.h"
+#include "dflash_commons.h"
 
 namespace mlc {
 namespace llm {
@@ -24,8 +25,13 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
       DraftTokenWorkspaceManager draft_token_workspace_manager, EngineConfig engine_config,
       std::vector<tvm::ffi::json::Object> model_configs,
       Optional<EventTraceRecorder> trace_recorder)
-      : BatchPrefillBaseActionObj(std::move(models), std::move(engine_config),
-                                  std::move(model_configs), std::move(trace_recorder)),
+      // Pass only target model (model 0) to base class for KV cache page checks.
+      // The DFlash draft model (model 1) is stateless with no KV cache, so it must
+      // not participate in prefill space calculations.
+      : BatchPrefillBaseActionObj(Array<Model>{models[0]}, std::move(engine_config),
+                                  std::vector<tvm::ffi::json::Object>{model_configs[0]},
+                                  std::move(trace_recorder)),
+        all_models_(std::move(models)),
         logit_processor_(std::move(logit_processor)),
         sampler_(std::move(sampler)),
         model_workspaces_(std::move(model_workspaces)),
@@ -58,6 +64,7 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
     std::vector<RequestStateStatus> status_before_prefill;
     UpdateRequestToAlive(prefill_inputs, estate, &request_ids, &rstates_of_entries,
                          &status_before_prefill);
+    auto& projected_hidden_state_map = *model_workspaces_[0].dflash_projected_target_hidden;
 
     // - Get embedding and run prefill for target model (model 0) only.
     //   DFlash draft model (model 1) has no KV cache and no separate prefill.
@@ -137,14 +144,17 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
       // target_hidden: [1, total_seq_len, num_layers * hidden_size]
       // projected:     [1, total_seq_len, hidden_size]
       RECORD_EVENT(trace_recorder_, request_ids, "start project target hidden");
-      ObjectRef projected = models_[1]->ProjectTargetHiddenStates(target_hidden);
+      ObjectRef projected = all_models_[1]->ProjectTargetHiddenStates(target_hidden);
       RECORD_EVENT(trace_recorder_, request_ids, "finish project target hidden");
 
-      // Store projected target hidden per request.
-      // TODO(dflash): For multi-request prefill, slice the projected tensor per request.
-      // For now, single-request is the common case and storing the full tensor works.
+      Tensor projected_nd = Downcast<Tensor>(projected);
+
+      int64_t projected_offset = 0;
       for (int i = 0; i < num_rsentries; ++i) {
-        model_workspaces_[0].dflash_projected_target_hidden[request_internal_ids[i]] = projected;
+        int64_t request_length = prefill_lengths[i];
+        DFlashProjectedHiddenState& state = projected_hidden_state_map[request_internal_ids[i]];
+        AppendProjectedHiddenRows(&state, projected_nd, projected_offset, request_length);
+        projected_offset += request_length;
       }
     }
 
@@ -224,15 +234,57 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
     UpdateRequestStateEntriesWithSampleResults(rsentries_for_sample, rsentry_activated,
                                                sample_results);
 
+    // For forked child entries, initialize projected context from the parent request.
+    // Activated children additionally need the frontier token hidden state appended below.
+    std::vector<int64_t> frontier_request_internal_ids;
+    std::vector<int32_t> frontier_token_ids;
+    std::vector<int> frontier_sample_indices;
+    Array<String> frontier_request_ids;
+    frontier_request_internal_ids.reserve(rsentries_for_sample.size());
+    frontier_token_ids.reserve(rsentries_for_sample.size());
+    frontier_sample_indices.reserve(rsentries_for_sample.size());
+    frontier_request_ids.reserve(rsentries_for_sample.size());
+
+    for (int sample_idx = 0; sample_idx < static_cast<int>(rsentries_for_sample.size()); ++sample_idx) {
+      int source_prefill_idx = child_sample_indices[sample_idx];
+      int64_t source_internal_id = prefill_inputs[source_prefill_idx].rsentry->mstates[0]->internal_id;
+      int64_t sampled_internal_id = rsentries_for_sample[sample_idx]->mstates[0]->internal_id;
+      if (sampled_internal_id != source_internal_id) {
+        projected_hidden_state_map[sampled_internal_id] =
+            CloneProjectedHiddenState(projected_hidden_state_map.at(source_internal_id));
+      }
+      if (!rsentry_activated[sample_idx]) {
+        continue;
+      }
+      frontier_request_internal_ids.push_back(sampled_internal_id);
+      frontier_token_ids.push_back(sample_results[sample_idx].GetTokenId());
+      frontier_sample_indices.push_back(sample_idx);
+      frontier_request_ids.push_back(rsentries_for_sample[sample_idx]->request->id);
+    }
+
+    if (!frontier_request_internal_ids.empty()) {
+      RECORD_EVENT(trace_recorder_, frontier_request_ids, "start frontier hidden extraction");
+      Tensor frontier_projected = ExtractProjectedFrontierHiddenStates(
+          estate, models_[0], all_models_[1], frontier_request_internal_ids, frontier_token_ids);
+      RECORD_EVENT(trace_recorder_, frontier_request_ids, "finish frontier hidden extraction");
+
+      for (int frontier_idx = 0; frontier_idx < static_cast<int>(frontier_sample_indices.size());
+           ++frontier_idx) {
+        int sample_idx = frontier_sample_indices[frontier_idx];
+        int64_t sampled_internal_id = rsentries_for_sample[sample_idx]->mstates[0]->internal_id;
+        AppendProjectedHiddenRows(&projected_hidden_state_map[sampled_internal_id],
+                                  frontier_projected, frontier_idx, /*num_rows=*/1);
+      }
+    }
+
     // Update engine metrics
     auto tend = std::chrono::high_resolution_clock::now();
     estate->metrics.engine_prefill_time_sum += static_cast<double>((tend - tstart).count()) / 1e9;
 
-    Array<Request> processed_requests;
-    processed_requests.reserve(num_rsentries);
-    for (int i = 0; i < num_rsentries; ++i) {
-      processed_requests.push_back(prefill_inputs[i].rsentry->request);
-    }
+    // Remove fully-prefilled requests from waiting_queue (moves them to running-only).
+    std::vector<Request> processed_requests =
+        RemoveProcessedRequests(prefill_inputs, estate, rstates_of_entries);
+    estate->running_rsentries_changed = true;
 
     return processed_requests;
   }
@@ -302,6 +354,8 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
     return 0;
   }
 
+  /*! \brief All models (target + draft). Used for draft model operations. */
+  Array<Model> all_models_;
   /*! \brief The logit processor. */
   LogitProcessor logit_processor_;
   /*! \brief The sampler to sample new tokens. */
@@ -318,7 +372,7 @@ EngineAction EngineAction::DFlashNewRequestPrefill(
     DraftTokenWorkspaceManager draft_token_workspace_manager, EngineConfig engine_config,
     std::vector<tvm::ffi::json::Object> model_configs,
     Optional<EventTraceRecorder> trace_recorder) {
-  return EngineAction(make_object<DFlashNewRequestPrefillActionObj>(
+  return EngineAction(tvm::ffi::make_object<DFlashNewRequestPrefillActionObj>(
       std::move(models), std::move(logit_processor), std::move(sampler),
       std::move(model_workspaces), std::move(draft_token_workspace_manager),
       std::move(engine_config), std::move(model_configs), std::move(trace_recorder)));

@@ -135,7 +135,6 @@ class ThreadedEngineImpl : public ThreadedEngine {
   void RunBackgroundLoop() final {
     // The local vectors that load the requests from critical regions.
     std::vector<std::pair<InstructionKind, Any>> local_instruction_queue;
-
     while (!exit_now_.load(std::memory_order_relaxed)) {
       {
         std::unique_lock<std::mutex> lock(background_loop_mutex_);

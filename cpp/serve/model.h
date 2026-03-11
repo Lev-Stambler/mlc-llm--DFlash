@@ -11,6 +11,7 @@
 #include <tvm/ffi/string.h>
 #include <tvm/runtime/tensor.h>
 
+#include <memory>
 #include <unordered_map>
 
 #include "../base.h"
@@ -31,6 +32,27 @@ using namespace tvm::runtime;
 
 // Declare the sampler class for `Model::CreateSampler`.
 class Sampler;
+
+struct DFlashProjectedHiddenState {
+  Tensor storage{nullptr};
+  int64_t length = 0;
+  int64_t capacity = 0;
+
+  bool defined() const { return storage.defined(); }
+
+  Tensor View() const {
+    TVM_FFI_ICHECK(defined());
+    TVM_FFI_ICHECK_EQ(storage->ndim, 3);
+    TVM_FFI_ICHECK_LE(length, capacity);
+    return storage.CreateView({1, length, storage->shape[2]}, storage->dtype);
+  }
+};
+
+struct DFlashDraftAuxTensors {
+  Tensor cos{nullptr};
+  Tensor sin{nullptr};
+  Tensor mask{nullptr};
+};
 
 /*!
  * \brief The workspace tensors that may be shared across different
@@ -69,8 +91,17 @@ struct ModelWorkspace {
   /*!
    * \brief DFlash: projected target hidden states per request, keyed by internal_id.
    * Persists from prefill/verify to the next draft step.
+   * Wrapped in shared_ptr so all engine actions share the same map.
    */
-  std::unordered_map<int64_t, ObjectRef> dflash_projected_target_hidden;
+  std::shared_ptr<std::unordered_map<int64_t, DFlashProjectedHiddenState>>
+      dflash_projected_target_hidden =
+          std::make_shared<std::unordered_map<int64_t, DFlashProjectedHiddenState>>();
+
+  /*!
+   * \brief DFlash draft auxiliary tensors cached by total sequence length.
+   */
+  std::shared_ptr<std::unordered_map<int64_t, DFlashDraftAuxTensors>> dflash_draft_aux_tensors =
+      std::make_shared<std::unordered_map<int64_t, DFlashDraftAuxTensors>>();
 };
 
 /*!
@@ -380,6 +411,8 @@ class ModelObj : public Object {
   virtual std::pair<Tensor, ObjectRef> BatchPrefillWithHiddenStates(
       const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
       const std::vector<int>& lengths) = 0;
+  virtual std::pair<Tensor, ObjectRef> BatchDecodeWithHiddenStates(
+      const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids) = 0;
 
   /*!
    * \brief Batch verify returning both logits and intermediate hidden states.

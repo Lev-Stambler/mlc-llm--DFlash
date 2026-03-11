@@ -52,14 +52,11 @@ BatchPrefillBaseActionObj::GetRequestStateEntriesToPrefill(EngineState estate) {
     NVTXScopedRange nvtx_scope("BatchDecode getting requests");
     running_rsentries = &estate->GetRunningRequestStateEntries();
     if (!(running_rsentries->size() <= models_[0]->GetNumAvailablePages())) {
-      // Even the decode cannot be performed.
-      // As a result, directly return without doing prefill.
       return {};
     }
   }
 
   if (estate->waiting_queue.empty()) {
-    // No request to prefill.
     return {};
   }
 
@@ -89,7 +86,6 @@ BatchPrefillBaseActionObj::GetRequestStateEntriesToPrefill(EngineState estate) {
       NVTXScopedRange nvtx_scope("KV cache GetCurrentTotalSequenceLength");
       current_total_seq_len = models_[i]->GetCurrentTotalSequenceLength();
     }
-
     int num_prefill_rsentries = 0;
     for (const Request& request : estate->waiting_queue) {
       NVTXScopedRange nvtx_scope("Process request " + request->id);
@@ -98,14 +94,18 @@ BatchPrefillBaseActionObj::GetRequestStateEntriesToPrefill(EngineState estate) {
       }
       RequestState rstate = estate->GetRequestState(request);
       bool prefill_stops = false;
-      for (const RequestStateEntry& rsentry : rstate->entries) {
+      for (int entry_idx = 0; entry_idx < static_cast<int>(rstate->entries.size()); ++entry_idx) {
+        const RequestStateEntry& rsentry = rstate->entries[entry_idx];
         // A request state entry can be prefilled only when:
         // - it has inputs, and
         // - it has no parent or its parent is alive and has no remaining input.
-        if (rsentry->mstates[i]->inputs.empty() ||
-            (rsentry->parent_idx != -1 &&
+        bool inputs_empty = (i < static_cast<int>(rsentry->mstates.size())) ?
+            rsentry->mstates[i]->inputs.empty() : true;
+        bool parent_blocks = rsentry->parent_idx != -1 &&
              (rstate->entries[rsentry->parent_idx]->status == RequestStateStatus::kPending ||
-              !rstate->entries[rsentry->parent_idx]->mstates[i]->inputs.empty()))) {
+              (i < static_cast<int>(rstate->entries[rsentry->parent_idx]->mstates.size()) &&
+               !rstate->entries[rsentry->parent_idx]->mstates[i]->inputs.empty()));
+        if (inputs_empty || parent_blocks) {
           continue;
         }
 
@@ -279,7 +279,11 @@ bool BatchPrefillBaseActionObj::CanPrefill(EngineState estate, int num_prefill_r
 
   // No exceeding of the maximum allowed requests that can
   // run simultaneously.
-  int spec_factor = engine_config_->speculative_mode != SpeculativeMode::kDisable
+  // DFlash draft model is stateless (no KV cache), so draft tokens don't create
+  // additional KV sequences. Only apply spec_factor for modes that use KV cache
+  // for draft tokens (e.g., EAGLE).
+  int spec_factor = (engine_config_->speculative_mode != SpeculativeMode::kDisable &&
+                     engine_config_->speculative_mode != SpeculativeMode::kDFlash)
                         ? (estate->spec_draft_length + 1)
                         : 1;
   if ((num_running_rsentries + num_prefill_rsentries) * spec_factor >

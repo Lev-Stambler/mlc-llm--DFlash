@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 from tvm import tir
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
+from tvm.relax.frontend.nn.op import wrap_nested
+from tvm.relax.op import strided_slice as _strided_slice
 
 from mlc_llm import op as op_ext
 from mlc_llm.model.qwen3.qwen3_model import Qwen3MLP
@@ -142,14 +144,29 @@ class DFlashAttention(nn.Module):  # pylint: disable=too-many-instance-attribute
         k_draft = self.k_norm(k_draft)
 
         # Apply RoPE separately: ctx uses positions 0..kv_len-1,
-        # draft uses positions kv_len..kv_len+q_len-1
-        ctx_pos = op.arange(0, kv_len, dtype="int32")
-        draft_pos = op.arange(kv_len, kv_len + q_len, dtype="int32")
-
-        ctx_cos = op.take(cos, ctx_pos, axis=1)
-        ctx_sin = op.take(sin, ctx_pos, axis=1)
-        draft_cos = op.take(cos, draft_pos, axis=1)
-        draft_sin = op.take(sin, draft_pos, axis=1)
+        # draft uses positions kv_len..kv_len+q_len-1.
+        # Use tvm.relax.op.strided_slice with assume_inbound=True so the shape
+        # simplifier can reduce ceildiv(kv_len - 0, 1) -> kv_len cleanly.
+        ctx_cos = wrap_nested(
+            _strided_slice(cos._expr, axes=[1], begin=[0], end=[kv_len],
+                           assume_inbound=True),
+            name="ctx_cos",
+        )
+        ctx_sin = wrap_nested(
+            _strided_slice(sin._expr, axes=[1], begin=[0], end=[kv_len],
+                           assume_inbound=True),
+            name="ctx_sin",
+        )
+        draft_cos = wrap_nested(
+            _strided_slice(cos._expr, axes=[1], begin=[kv_len], end=[kv_len + q_len],
+                           assume_inbound=True),
+            name="draft_cos",
+        )
+        draft_sin = wrap_nested(
+            _strided_slice(sin._expr, axes=[1], begin=[kv_len], end=[kv_len + q_len],
+                           assume_inbound=True),
+            name="draft_sin",
+        )
 
         q = _apply_rope(q, draft_cos, draft_sin)
         k_ctx = _apply_rope(k_ctx, ctx_cos, ctx_sin)
@@ -303,8 +320,22 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
             self.dtype = dtype
 
     def project_target_hidden(self, target_hidden: Tensor) -> Tensor:
-        """Project concatenated multi-layer target hidden states to hidden_size."""
-        return self.hidden_norm(self.fc(target_hidden))
+        """Project concatenated multi-layer target hidden states to hidden_size.
+
+        The fc matmul reduces 20480 dimensions (5 layers × 4096 hidden) to 4096.
+        Target hidden states can have large values (max_abs ~60) from concatenated
+        layer activations. In float16, the dot product of 20480 large values
+        overflows (sum can exceed 65504). We compute in float32 and keep float32
+        through RMSNorm — the matmul output can also exceed 65504 so we must
+        normalize before casting back to float16.
+        """
+        w = self.fc.weight.astype("float32")
+        h = target_hidden.astype("float32")
+        projected = op.matmul(h, op.permute_dims(w, [1, 0]))
+        # RMSNorm in float32: weight is fp16 but op.rms_norm handles the cast
+        gamma = self.hidden_norm.weight.astype("float32")
+        normalized = op.rms_norm(projected, weight=gamma, axes=[-1], epsilon=self.hidden_norm.epsilon)
+        return normalized.astype(self.dtype)
 
     def draft_forward(
         self,

@@ -452,12 +452,22 @@ class EngineImpl : public Engine {
                "enabled and not implemented with hybrid prefill yet.";
       }
     }
+    // - Compute max_num_tokens early: needed for logit_pos_arr_ sizing in SetMaxNumSequence.
+    // For speculative decoding, scatter/gather draft probs operate on up to
+    // max_num_sequence * (spec_draft_length + 1) positions at once.
+    int max_num_tokens = engine_config->max_num_sequence;
+    if (engine_config->speculative_mode != SpeculativeMode::kDisable) {
+      max_num_tokens = std::max(max_num_tokens,
+          max_num_tokens * (engine_config->spec_draft_length + 1));
+    }
     // - Load model weights, create KV cache and workspace.
     n->model_workspaces_.clear();
     for (int model_id = 0; model_id < static_cast<int>(n->models_.size()); ++model_id) {
       const Model& model = n->models_[model_id];
       model->LoadParams();
-      model->SetMaxNumSequence(engine_config->max_num_sequence);
+      // Use max_num_tokens so logit_pos_arr_ is large enough for speculative decoding
+      // scatter/gather operations. KV cache creation below uses max_num_sequence directly.
+      model->SetMaxNumSequence(max_num_tokens);
       model->SetPrefillChunkSize(engine_config->prefill_chunk_size);
       // Skip KV cache creation for DFlash draft model (model_id > 0) — it is stateless.
       if (!(engine_config->speculative_mode == SpeculativeMode::kDFlash && model_id > 0)) {
@@ -474,7 +484,6 @@ class EngineImpl : public Engine {
     n->cached_grammar_compiler_ = xgrammar::CachedGrammarCompiler(n->token_table_);
     // - Create the logit processor and sampler, and
     // the DraftTokenWorkspaceManager for speculative decoding.
-    int max_num_tokens = engine_config->max_num_sequence;
     DraftTokenWorkspaceManager draft_token_workspace_manager{nullptr};
     if (engine_config->speculative_mode != SpeculativeMode::kDisable) {
       // multiply max num_tokens by two so we can do ping-pong swaping during draft/verify process

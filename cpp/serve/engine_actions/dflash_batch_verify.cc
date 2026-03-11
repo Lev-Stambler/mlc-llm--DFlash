@@ -18,6 +18,7 @@
 #include "../sampler/sampler.h"
 #include "action.h"
 #include "action_commons.h"
+#include "dflash_commons.h"
 
 namespace mlc {
 namespace llm {
@@ -41,8 +42,7 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
         model_workspaces_(std::move(model_workspaces)),
         draft_token_workspace_manager_(std::move(draft_token_workspace_manager)),
         engine_config_(std::move(engine_config)),
-        trace_recorder_(std::move(trace_recorder)),
-        rng_(RandomGenerator::GetInstance()) {}
+        trace_recorder_(std::move(trace_recorder)) {}
 
   Array<Request> Step(EngineState estate) final {
     if (models_.size() != 2 || estate->running_queue.empty()) {
@@ -107,12 +107,6 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
       draft_output_tokens.push_back(draft_mstate->draft_output_tokens);
     }
 
-    // Use target model (model 0) for GatherDraftProbs since the DFlash draft model
-    // may not have scatter/gather probs functions compiled.
-    Tensor draft_probs_on_device = models_[verify_model_id_]->GatherDraftProbs(
-        model_workspaces_[verify_model_id_].draft_probs_storage, draft_token_slots_,
-        &model_workspaces_[verify_model_id_].draft_probs);
-
     std::vector<int> cum_verify_lengths = {0};
     cum_verify_lengths.reserve(num_rsentries + 1);
     std::vector<int> verify_lengths;
@@ -141,25 +135,63 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
     logit_processor_->InplaceUpdateLogits(logits, generation_cfg, verify_request_mstates,
                                           request_ids, &cum_verify_lengths, &draft_request_mstates,
                                           &draft_token_indices);
-    Tensor probs_on_device = logit_processor_->ComputeProbsFromLogits(
-        logits, generation_cfg, request_ids, &cum_verify_lengths);
-
     estate->prefix_cache->CommitSequenceExtention();
 
-    std::vector<int> sample_indices(num_rsentries);
-    std::iota(sample_indices.begin(), sample_indices.end(), 0);
-    Tensor renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
-        probs_on_device, sample_indices, request_ids, generation_cfg);
-    auto [sample_results_arr, _] = sampler_->BatchVerifyDraftTokensWithProbAfterTopP(
-        renormalized_probs, request_ids, cum_verify_lengths, generation_cfg, rngs,
-        draft_output_tokens, token_tree_parent_ptr, draft_probs_on_device);
+    bool deterministic_generation = true;
+    for (const GenerationConfig& cfg : generation_cfg) {
+      deterministic_generation &= IsDeterministicGenerationConfig(cfg);
+    }
+
+    std::vector<std::vector<SampleResult>> sample_results_arr;
+    if (deterministic_generation) {
+      Tensor logits_on_host = CopyTensorToCPU(logits);
+      sample_results_arr.resize(num_rsentries);
+      for (int i = 0; i < num_rsentries; ++i) {
+        int verify_start = cum_verify_lengths[i];
+        int draft_length = verify_lengths[i] - 1;
+        int draft_token_idx = 0;
+        for (; draft_token_idx < draft_length; ++draft_token_idx) {
+          int32_t target_token_id = ArgmaxTokenId(logits_on_host, verify_start + draft_token_idx);
+          if (target_token_id != draft_output_tokens[i][draft_token_idx].GetTokenId()) {
+            sample_results_arr[i].push_back(SampleResult{{target_token_id, 1.0f}, {}});
+            break;
+          }
+          sample_results_arr[i].push_back(draft_output_tokens[i][draft_token_idx]);
+        }
+        if (draft_token_idx == draft_length) {
+          sample_results_arr[i].push_back(
+              SampleResult{{ArgmaxTokenId(logits_on_host, verify_start + draft_length), 1.0f},
+                           {}});
+        }
+      }
+    } else {
+      Tensor probs_on_device = logit_processor_->ComputeProbsFromLogits(
+          logits, generation_cfg, request_ids, &cum_verify_lengths);
+      // Use target model (model 0) for GatherDraftProbs since the DFlash draft model
+      // may not have scatter/gather probs functions compiled.
+      Tensor draft_probs_on_device = models_[verify_model_id_]->GatherDraftProbs(
+          model_workspaces_[verify_model_id_].draft_probs_storage, draft_token_slots_,
+          &model_workspaces_[verify_model_id_].draft_probs);
+      std::vector<int> sample_indices(num_rsentries);
+      std::iota(sample_indices.begin(), sample_indices.end(), 0);
+      Tensor renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
+          probs_on_device, sample_indices, request_ids, generation_cfg);
+      std::tie(sample_results_arr, std::ignore) =
+          sampler_->BatchVerifyDraftTokensWithProbAfterTopP(
+              renormalized_probs, request_ids, cum_verify_lengths, generation_cfg, rngs,
+              draft_output_tokens, token_tree_parent_ptr, draft_probs_on_device);
+    }
     TVM_FFI_ICHECK_EQ(sample_results_arr.size(), num_rsentries);
 
     // Process acceptance results.
     std::vector<int64_t> verify_model_seq_internal_ids;
     std::vector<int64_t> accepted_token_tree_leaf_nodes;
+    std::vector<int> accepted_draft_lengths;
+    std::vector<int32_t> frontier_token_ids;
     verify_model_seq_internal_ids.reserve(num_rsentries);
     accepted_token_tree_leaf_nodes.reserve(num_rsentries);
+    accepted_draft_lengths.reserve(num_rsentries);
+    frontier_token_ids.reserve(num_rsentries);
 
     for (int i = 0; i < num_rsentries; ++i) {
       const std::vector<SampleResult>& sample_results = sample_results_arr[i];
@@ -175,12 +207,11 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
       estate->metrics.spec_decode.Update(cum_verify_lengths[i + 1] - cum_verify_lengths[i],
                                          accept_length);
 
-      int rollback_length =
-          std::max(cum_verify_lengths[i + 1] - cum_verify_lengths[i] - accept_length, 0);
-
       // Commit accepted tokens to target model KV cache
       verify_model_seq_internal_ids.push_back(rsentries[i]->mstates[verify_model_id_]->internal_id);
       accepted_token_tree_leaf_nodes.push_back(accept_length - 1);
+      accepted_draft_lengths.push_back(accept_length - 1);
+      frontier_token_ids.push_back(sample_results.back().GetTokenId());
 
       // KEY DIFFERENCE: No draft model KV rollback — DFlash draft is stateless.
       // We only need to rollback the target model if there are unaccepted tokens.
@@ -193,19 +224,31 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
     models_[verify_model_id_]->CommitAcceptedTokenTreeNodesToKVCache(
         verify_model_seq_internal_ids, accepted_token_tree_leaf_nodes);
 
-    // Project new target hidden states for the next DFlash draft round.
-    // Unlike EAGLE, we don't do a one-step draft here — the DFlash draft step
-    // handles all draft token generation from scratch using the projected hidden states.
+    // Materialize target hidden states for the verifier-sampled frontier token.
+    RECORD_EVENT(trace_recorder_, request_ids, "start frontier hidden extraction");
+    Tensor frontier_projected = ExtractProjectedFrontierHiddenStates(
+        estate, models_[verify_model_id_], models_[draft_model_id_], verify_model_seq_internal_ids,
+        frontier_token_ids);
+    RECORD_EVENT(trace_recorder_, request_ids, "finish frontier hidden extraction");
+
+    // Project the newly committed target hidden states and append them to the
+    // request-local context buffer.
     {
       RECORD_EVENT(trace_recorder_, request_ids, "start project target hidden (verify)");
-      ObjectRef projected = models_[draft_model_id_]->ProjectTargetHiddenStates(target_hidden);
-      RECORD_EVENT(trace_recorder_, request_ids, "finish project target hidden (verify)");
+      Tensor verify_projected =
+          Downcast<Tensor>(models_[draft_model_id_]->ProjectTargetHiddenStates(target_hidden));
+      auto& pth_map = *model_workspaces_[0].dflash_projected_target_hidden;
+      int64_t verify_offset = 0;
 
-      // Store per-request projected target hidden states.
-      // TODO(dflash): For multi-request verify, slice the projected tensor per request.
       for (int i = 0; i < num_rsentries; ++i) {
-        model_workspaces_[0].dflash_projected_target_hidden[request_internal_ids[i]] = projected;
+        int64_t internal_id = request_internal_ids[i];
+        DFlashProjectedHiddenState& projected_state = pth_map[internal_id];
+        AppendProjectedHiddenRows(&projected_state, verify_projected, verify_offset + 1,
+                                  accepted_draft_lengths[i]);
+        AppendProjectedHiddenRows(&projected_state, frontier_projected, i, /*num_rows=*/1);
+        verify_offset += verify_lengths[i];
       }
+      RECORD_EVENT(trace_recorder_, request_ids, "finish project target hidden (verify)");
     }
 
     // Reset num_tokens_for_next_decode
@@ -274,7 +317,6 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
   DraftTokenWorkspaceManager draft_token_workspace_manager_;
   EngineConfig engine_config_;
   Optional<EventTraceRecorder> trace_recorder_;
-  RandomGenerator& rng_;
   const int verify_model_id_ = 0;
   const int draft_model_id_ = 1;
   std::vector<int> draft_token_slots_;
