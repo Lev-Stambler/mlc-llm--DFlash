@@ -224,15 +224,12 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
     models_[verify_model_id_]->CommitAcceptedTokenTreeNodesToKVCache(
         verify_model_seq_internal_ids, accepted_token_tree_leaf_nodes);
 
-    // Materialize target hidden states for the verifier-sampled frontier token.
-    RECORD_EVENT(trace_recorder_, request_ids, "start frontier hidden extraction");
-    Tensor frontier_projected = ExtractProjectedFrontierHiddenStates(
-        estate, models_[verify_model_id_], models_[draft_model_id_], verify_model_seq_internal_ids,
-        frontier_token_ids);
-    RECORD_EVENT(trace_recorder_, request_ids, "finish frontier hidden extraction");
-
     // Project the newly committed target hidden states and append them to the
     // request-local context buffer.
+    // Include the committed token (position 0) + accepted draft tokens.
+    // Do NOT include the frontier token — during training, the context only
+    // contains tokens BEFORE the draft block. The frontier is the first token
+    // of the next block (in noise_embedding), not part of the context.
     {
       RECORD_EVENT(trace_recorder_, request_ids, "start project target hidden (verify)");
       Tensor verify_projected =
@@ -243,9 +240,9 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
       for (int i = 0; i < num_rsentries; ++i) {
         int64_t internal_id = request_internal_ids[i];
         DFlashProjectedHiddenState& projected_state = pth_map[internal_id];
-        AppendProjectedHiddenRows(&projected_state, verify_projected, verify_offset + 1,
-                                  accepted_draft_lengths[i]);
-        AppendProjectedHiddenRows(&projected_state, frontier_projected, i, /*num_rows=*/1);
+        // Append committed token + accepted draft tokens (positions 0..accepted_draft_lengths[i])
+        AppendProjectedHiddenRows(&projected_state, verify_projected, verify_offset,
+                                  accepted_draft_lengths[i] + 1);
         verify_offset += verify_lengths[i];
       }
       RECORD_EVENT(trace_recorder_, request_ids, "finish project target hidden (verify)");

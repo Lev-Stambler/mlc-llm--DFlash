@@ -235,16 +235,9 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
                                                sample_results);
 
     // For forked child entries, initialize projected context from the parent request.
-    // Activated children additionally need the frontier token hidden state appended below.
-    std::vector<int64_t> frontier_request_internal_ids;
-    std::vector<int32_t> frontier_token_ids;
-    std::vector<int> frontier_sample_indices;
-    Array<String> frontier_request_ids;
-    frontier_request_internal_ids.reserve(rsentries_for_sample.size());
-    frontier_token_ids.reserve(rsentries_for_sample.size());
-    frontier_sample_indices.reserve(rsentries_for_sample.size());
-    frontier_request_ids.reserve(rsentries_for_sample.size());
-
+    // Do NOT append the frontier token — during DFlash training, the context only
+    // contains tokens BEFORE the draft block. The frontier (first block token) goes
+    // into the noise_embedding, not the projected context.
     for (int sample_idx = 0; sample_idx < static_cast<int>(rsentries_for_sample.size()); ++sample_idx) {
       int source_prefill_idx = child_sample_indices[sample_idx];
       int64_t source_internal_id = prefill_inputs[source_prefill_idx].rsentry->mstates[0]->internal_id;
@@ -252,28 +245,6 @@ class DFlashNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
       if (sampled_internal_id != source_internal_id) {
         projected_hidden_state_map[sampled_internal_id] =
             CloneProjectedHiddenState(projected_hidden_state_map.at(source_internal_id));
-      }
-      if (!rsentry_activated[sample_idx]) {
-        continue;
-      }
-      frontier_request_internal_ids.push_back(sampled_internal_id);
-      frontier_token_ids.push_back(sample_results[sample_idx].GetTokenId());
-      frontier_sample_indices.push_back(sample_idx);
-      frontier_request_ids.push_back(rsentries_for_sample[sample_idx]->request->id);
-    }
-
-    if (!frontier_request_internal_ids.empty()) {
-      RECORD_EVENT(trace_recorder_, frontier_request_ids, "start frontier hidden extraction");
-      Tensor frontier_projected = ExtractProjectedFrontierHiddenStates(
-          estate, models_[0], all_models_[1], frontier_request_internal_ids, frontier_token_ids);
-      RECORD_EVENT(trace_recorder_, frontier_request_ids, "finish frontier hidden extraction");
-
-      for (int frontier_idx = 0; frontier_idx < static_cast<int>(frontier_sample_indices.size());
-           ++frontier_idx) {
-        int sample_idx = frontier_sample_indices[frontier_idx];
-        int64_t sampled_internal_id = rsentries_for_sample[sample_idx]->mstates[0]->internal_id;
-        AppendProjectedHiddenRows(&projected_hidden_state_map[sampled_internal_id],
-                                  frontier_projected, frontier_idx, /*num_rows=*/1);
       }
     }
 

@@ -1,0 +1,29 @@
+# SkyPilot task: Benchmark DFlash vs baseline on a GPU instance.
+#
+# Usage:
+#   bash dflash_bench/pack.sh              # Create repo tarball (bypasses .gitignore issues)
+#   sky launch dflash_bench/sky_bench.yaml -c dflash-bench -y
+#   scp dflash-bench:~/mlc-llm/dflash_bench/results/*.json dflash_bench/results/
+#   sky down dflash-bench -y
+
+name: dflash-bench
+
+resources:
+  accelerators: A10G:1
+  cloud: aws
+  disk_size: 100
+
+# Upload tarball directly (scp, no .gitignore filtering)
+file_mounts:
+  ~/repo.tar.gz: dflash_bench/repo.tar.gz
+
+setup: |
+  # Extract repo from tarball (avoids SkyPilot workdir .gitignore issues)
+  mkdir -p ~/mlc-llm && cd ~/mlc-llm
+  tar xzf ~/repo.tar.gz
+  chmod +x dflash_bench/setup_gpu.sh dflash_bench/bench_remote.sh
+  bash dflash_bench/setup_gpu.sh
+
+run: |
+  cd ~/mlc-llm
+  bash dflash_bench/bench_remote.sh

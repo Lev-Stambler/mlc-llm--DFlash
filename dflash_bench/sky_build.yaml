@@ -1,0 +1,54 @@
+# Stage 1: Build TVM + MLC LLM on a beefy CPU+GPU instance.
+# After build completes, launch sky_serve_prebuilt.yaml on same cluster.
+#
+# Usage:
+#   sky launch dflash_bench/sky_build.yaml -c dflash-serve
+#   # Wait for build to finish, then:
+#   sky launch dflash_bench/sky_serve_prebuilt.yaml -c dflash-serve
+
+name: dflash-build
+
+resources:
+  # 8 vCPUs for faster compilation + A10G for model compilation (needs GPU)
+  accelerators: A10G:1
+  instance_type: g5.2xlarge  # 8 vCPUs, 32GB RAM
+  cloud: aws
+  disk_size: 150
+  ports:
+    - 7860
+    - 8787
+
+workdir: .
+
+setup: |
+  cd ~/sky_workdir
+  chmod +x dflash_bench/setup_gpu_serve.sh
+  bash dflash_bench/setup_gpu_serve.sh
+
+run: |
+  cd ~/sky_workdir
+  source .venv/bin/activate
+  export PYTHONPATH=$PWD/3rdparty/tvm/3rdparty/tvm-ffi/python:$PWD/3rdparty/tvm/python:$PWD/python:$PYTHONPATH
+  export TVM_LIBRARY_PATH=$PWD/3rdparty/tvm/build
+  export MLC_LLM_LIB_PATH=$PWD/build
+
+  echo "=== Starting MLC LLM serve (DFlash speculative decoding) ==="
+  python -m mlc_llm serve \
+    dist/Qwen3-8B-q0f16-MLC \
+    --model-lib dist/Qwen3-8B-q0f16-MLC/Qwen3-8B-q0f16-cuda.so \
+    --speculative-mode dflash \
+    --additional-models "dist/Qwen3-8B-DFlash-b16-q0bf16-MLC,dist/Qwen3-8B-DFlash-b16-q0bf16-MLC/Qwen3-8B-DFlash-b16-q0bf16-cuda.so" \
+    --overrides "spec_draft_length=16" \
+    --host 0.0.0.0 --port 8787 &
+
+  echo "Waiting for MLC LLM server..."
+  for i in $(seq 1 60); do
+    if curl -s http://127.0.0.1:8787/v1/models > /dev/null 2>&1; then
+      echo "MLC LLM server is up!"
+      break
+    fi
+    sleep 2
+  done
+
+  echo "=== Starting Gradio chat UI ==="
+  python dflash_bench/gradio_chat.py
