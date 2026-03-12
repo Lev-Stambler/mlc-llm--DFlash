@@ -1,7 +1,7 @@
 tmp/
 dist/
 params/
-debug/
+/debug/
 *.bak
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -322,5 +322,6 @@ gallery/how_to/work_with_microtvm/micro_tvmc.py
 
 dist
 
-# DFlash benchmark results (uncommitted)
+# DFlash benchmark artifacts (uncommitted)
 dflash_bench/results/
+dflash_bench/repo.tar.gz

@@ -62,7 +62,9 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
     auto tstart = std::chrono::high_resolution_clock::now();
 
     int num_rsentries = running_rsentries.size();
-    TVM_FFI_ICHECK_GT(num_rsentries, 0);
+    if (num_rsentries == 0) {
+      return {};
+    }
 
     Array<String> request_ids;
     std::vector<int64_t> request_internal_ids;
