@@ -353,7 +353,7 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
             hidden_states = layer(
                 hidden_states, projected_target_hidden, cos, sin, attention_mask
             )
-        return self.norm(hidden_states).astype("float16")
+        return self.norm(hidden_states).astype(self.dtype)
 
     def batch_draft_forward(
         self,
@@ -372,12 +372,12 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
     def get_default_spec(self):
         mod_spec = {
             "project_target_hidden": {
-                # Input uses float16 because the target model (q4f16_1) produces
-                # fp16 hidden states. The function immediately casts to float32
-                # internally, so input dtype doesn't affect accuracy.
+                # Input dtype must match target model's activation dtype.
+                # The function immediately casts to float32 internally to
+                # avoid overflow, so input dtype doesn't affect accuracy.
                 "target_hidden": nn.spec.Tensor(
                     [1, "seq_len", self.hidden_size * len([1, 9, 17, 25, 33])],
-                    "float16",
+                    self.dtype,
                 ),
                 "$": {
                     "param_mode": "packed",
@@ -385,10 +385,10 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
                 },
             },
             "draft_forward": {
-                # noise_embedding uses float16 because it comes from target model's
-                # embedder (q4f16_1). draft_forward casts to self.dtype internally.
+                # noise_embedding dtype must match target model's activation dtype,
+                # since it comes from target model's embedder.
                 "noise_embedding": nn.spec.Tensor(
-                    [1, "block_size", self.hidden_size], "float16"
+                    [1, "block_size", self.hidden_size], self.dtype
                 ),
                 "projected_target_hidden": nn.spec.Tensor(
                     [1, "ctx_len", self.hidden_size], self.dtype
