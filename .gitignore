@@ -91,7 +91,6 @@ docs/_build/
 docs/_staging/
 
 # PyBuilder
-target/
 /target/
 
 # Jupyter Notebook
@@ -322,3 +321,6 @@ gallery/how_to/work_with_microtvm/micro_tvmc.py
 .gdb_history
 
 dist
+
+# DFlash benchmark results (uncommitted)
+dflash_bench/results/

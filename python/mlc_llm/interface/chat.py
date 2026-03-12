@@ -89,6 +89,8 @@ class ModelConfigOverride(ConfigOverrideBase):  # pylint: disable=too-many-insta
     attention_sink_size: Optional[int] = None
     tensor_parallel_shards: Optional[int] = None
     pipeline_parallel_stages: Optional[int] = None
+    max_total_seq_length: Optional[int] = None
+    gpu_memory_utilization: Optional[float] = None
     opt: Optional[str] = None
 
     @staticmethod
@@ -102,6 +104,8 @@ class ModelConfigOverride(ConfigOverrideBase):  # pylint: disable=too-many-insta
         parser.add_argument("--sliding_window_size", type=int, default=None)
         parser.add_argument("--prefill_chunk_size", type=int, default=None)
         parser.add_argument("--attention_sink_size", type=int, default=None)
+        parser.add_argument("--max_total_seq_length", type=int, default=None)
+        parser.add_argument("--gpu_memory_utilization", type=float, default=None)
 
         results = parser.parse_args([f"--{i}" for i in source.split(";") if i])
         return ModelConfigOverride(
@@ -112,6 +116,8 @@ class ModelConfigOverride(ConfigOverrideBase):  # pylint: disable=too-many-insta
             sliding_window_size=results.sliding_window_size,
             prefill_chunk_size=results.prefill_chunk_size,
             attention_sink_size=results.attention_sink_size,
+            max_total_seq_length=results.max_total_seq_length,
+            gpu_memory_utilization=results.gpu_memory_utilization,
         )
 
 
@@ -284,8 +290,13 @@ def chat(
     device: str,
     model_lib: Optional[str],
     overrides: ModelConfigOverride,
+    speculative_mode: str = "disable",
+    additional_models: Optional[List[Union[str, tuple]]] = None,
+    spec_draft_length: int = 0,
 ):
     """Chat cli entry"""
+    if additional_models is None:
+        additional_models = []
     # By default we use JSONFFIEngine
     ChatState(
         JSONFFIEngine(
@@ -295,12 +306,17 @@ def chat(
             mode="interactive",
             engine_config=EngineConfig(
                 max_single_sequence_length=overrides.context_window_size,
+                max_total_sequence_length=overrides.max_total_seq_length,
                 prefill_chunk_size=overrides.prefill_chunk_size,
                 sliding_window_size=overrides.sliding_window_size,
                 attention_sink_size=overrides.attention_sink_size,
                 tensor_parallel_shards=overrides.tensor_parallel_shards,
                 pipeline_parallel_stages=overrides.pipeline_parallel_stages,
+                gpu_memory_utilization=overrides.gpu_memory_utilization,
                 opt=overrides.opt,
+                speculative_mode=speculative_mode,
+                additional_models=additional_models,
+                spec_draft_length=spec_draft_length,
             ),
         )
     ).chat()

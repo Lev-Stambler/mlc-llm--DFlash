@@ -346,12 +346,14 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
         attention_mask: Tensor,
     ) -> Tensor:
         """Single-pass block draft forward. Returns hidden states for all block positions."""
-        hidden_states = noise_embedding
+        # Cast embedding to model dtype (bf16) since it comes from target model (fp16).
+        # Internal computation in bf16 for accuracy, output cast to fp16 for target model's get_logits.
+        hidden_states = noise_embedding.astype(self.dtype)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states, projected_target_hidden, cos, sin, attention_mask
             )
-        return self.norm(hidden_states)
+        return self.norm(hidden_states).astype("float16")
 
     def batch_draft_forward(
         self,
@@ -370,9 +372,12 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
     def get_default_spec(self):
         mod_spec = {
             "project_target_hidden": {
+                # Input uses float16 because the target model (q4f16_1) produces
+                # fp16 hidden states. The function immediately casts to float32
+                # internally, so input dtype doesn't affect accuracy.
                 "target_hidden": nn.spec.Tensor(
                     [1, "seq_len", self.hidden_size * len([1, 9, 17, 25, 33])],
-                    self.dtype,
+                    "float16",
                 ),
                 "$": {
                     "param_mode": "packed",
@@ -380,8 +385,10 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
                 },
             },
             "draft_forward": {
+                # noise_embedding uses float16 because it comes from target model's
+                # embedder (q4f16_1). draft_forward casts to self.dtype internally.
                 "noise_embedding": nn.spec.Tensor(
-                    [1, "block_size", self.hidden_size], self.dtype
+                    [1, "block_size", self.hidden_size], "float16"
                 ),
                 "projected_target_hidden": nn.spec.Tensor(
                     [1, "ctx_len", self.hidden_size], self.dtype
@@ -398,7 +405,7 @@ class DFlashDraftModel(nn.Module):  # pylint: disable=too-many-instance-attribut
             },
             "batch_draft_forward": {
                 "noise_embedding": nn.spec.Tensor(
-                    ["batch_size", "block_size", self.hidden_size], self.dtype
+                    ["batch_size", "block_size", self.hidden_size], "float16"
                 ),
                 "projected_target_hidden": nn.spec.Tensor(
                     ["batch_size", "ctx_len", self.hidden_size], self.dtype

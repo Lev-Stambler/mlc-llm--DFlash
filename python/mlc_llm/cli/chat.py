@@ -32,10 +32,42 @@ def main(argv):
         default="",
         help=HELP["modelconfig_overrides"] + ' (default: "%(default)s")',
     )
+    parser.add_argument(
+        "--speculative-mode",
+        type=str,
+        choices=["disable", "small_draft", "eagle", "medusa", "dflash"],
+        default="disable",
+        help=HELP["speculative_mode_serve"] + ' (default: "%(default)s")',
+    )
+    parser.add_argument(
+        "--additional-models",
+        type=str,
+        nargs="*",
+        help=HELP["additional_models_serve"],
+    )
+    parser.add_argument(
+        "--spec-draft-length",
+        type=int,
+        default=0,
+        help=HELP["spec_draft_length_serve"] + ' (default: "%(default)s")',
+    )
     parsed = parser.parse_args(argv)
+
+    additional_models = []
+    if parsed.additional_models is not None:
+        for additional_model in parsed.additional_models:
+            splits = additional_model.split(",", maxsplit=1)
+            if len(splits) == 2:
+                additional_models.append((splits[0], splits[1]))
+            else:
+                additional_models.append(splits[0])
+
     chat(
         model=parsed.model,
         device=parsed.device,
         model_lib=parsed.model_lib,
         overrides=parsed.overrides,
+        speculative_mode=parsed.speculative_mode,
+        additional_models=additional_models,
+        spec_draft_length=parsed.spec_draft_length,
     )
