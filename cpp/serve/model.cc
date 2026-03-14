@@ -1309,6 +1309,7 @@ class ModelImpl : public ModelObj {
     NVTXScopedRange nvtx_scope("ProjectTargetHiddenStates");
     if (!ft_.project_target_hidden_func_.defined()) {
       // No projection function compiled — return input as-is (fallback path).
+      LOG(WARNING) << "[DFlash] project_target_hidden_func_ NOT defined — using raw hidden states!";
       return target_hidden;
     }
     // Call the project_target_hidden function to project concatenated hidden states

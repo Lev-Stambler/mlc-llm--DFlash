@@ -7,6 +7,11 @@
 #define MLC_LLM_SERVE_ENGINE_ACTIONS_DFLASH_COMMONS_H_
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 
 #include "../engine_state.h"
 #include "../model.h"
@@ -45,6 +50,162 @@ inline int32_t ArgmaxTokenId(const Tensor& cpu_tensor, int64_t row_index) {
     }
   }
   return argmax_token_id;
+}
+
+/*!
+ * \brief Get top-k token IDs and logit values from a logits row on CPU.
+ * Returns vector of (token_id, logit_value) sorted descending by logit.
+ */
+struct TopKEntry {
+  int32_t token_id;
+  float logit;
+};
+
+inline std::vector<TopKEntry> TopKLogits(const Tensor& cpu_tensor, int64_t row_index, int k = 5) {
+  TVM_FFI_ICHECK_EQ(cpu_tensor->device.device_type, kDLCPU);
+  TVM_FFI_ICHECK_EQ(cpu_tensor->ndim, 2);
+  TVM_FFI_ICHECK(cpu_tensor.IsContiguous());
+  TVM_FFI_ICHECK_EQ(cpu_tensor.DataType(), DataType::Float(32));
+
+  int64_t vocab_size = cpu_tensor->shape[1];
+  const float* row = static_cast<const float*>(cpu_tensor->data) + row_index * vocab_size;
+
+  // Partial sort to find top-k
+  std::vector<TopKEntry> entries(vocab_size);
+  for (int64_t i = 0; i < vocab_size; ++i) {
+    entries[i] = {static_cast<int32_t>(i), row[i]};
+  }
+  std::partial_sort(entries.begin(), entries.begin() + std::min<int64_t>(k, vocab_size),
+                    entries.end(),
+                    [](const TopKEntry& a, const TopKEntry& b) { return a.logit > b.logit; });
+  entries.resize(std::min<int64_t>(k, vocab_size));
+  return entries;
+}
+
+/*!
+ * \brief Format top-k logits as a string for logging.
+ */
+inline std::string FormatTopK(const std::vector<TopKEntry>& entries) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << entries[i].token_id << ":" << std::fixed << std::setprecision(2) << entries[i].logit;
+  }
+  oss << "]";
+  return oss.str();
+}
+
+/*!
+ * \brief Compute tensor statistics (min, max, mean, num_nan, num_zero) for a float tensor on CPU.
+ */
+struct TensorStats {
+  float min_val = 0;
+  float max_val = 0;
+  double mean_val = 0;
+  int64_t num_nan = 0;
+  int64_t num_inf = 0;
+  int64_t num_zero = 0;
+  int64_t total = 0;
+};
+
+inline TensorStats ComputeTensorStats(const Tensor& tensor) {
+  Tensor cpu_tensor = (tensor->device.device_type == kDLCPU) ? tensor
+                      : tensor.CopyTo(DLDevice{kDLCPU, 0});
+  TensorStats stats;
+  int64_t numel = 1;
+  for (int i = 0; i < cpu_tensor->ndim; ++i) {
+    numel *= cpu_tensor->shape[i];
+  }
+  stats.total = numel;
+  if (numel == 0) return stats;
+
+  // Handle both float32 and float16
+  if (cpu_tensor.DataType() == DataType::Float(32)) {
+    const float* data = static_cast<const float*>(cpu_tensor->data);
+    stats.min_val = data[0];
+    stats.max_val = data[0];
+    double sum = 0;
+    for (int64_t i = 0; i < numel; ++i) {
+      float v = data[i];
+      if (std::isnan(v)) { stats.num_nan++; continue; }
+      if (std::isinf(v)) { stats.num_inf++; continue; }
+      if (v == 0.0f) stats.num_zero++;
+      if (v < stats.min_val) stats.min_val = v;
+      if (v > stats.max_val) stats.max_val = v;
+      sum += v;
+    }
+    stats.mean_val = sum / (numel - stats.num_nan - stats.num_inf);
+  } else if (cpu_tensor.DataType() == DataType::Float(16)) {
+    // float16: read as uint16_t and convert
+    const uint16_t* data = static_cast<const uint16_t*>(cpu_tensor->data);
+    auto fp16_to_fp32 = [](uint16_t h) -> float {
+      uint32_t sign = (h >> 15) & 1;
+      uint32_t exp = (h >> 10) & 0x1f;
+      uint32_t mant = h & 0x3ff;
+      if (exp == 0x1f) {
+        if (mant != 0) return std::nanf("");
+        return sign ? -std::numeric_limits<float>::infinity()
+                    : std::numeric_limits<float>::infinity();
+      }
+      if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        // Denormal
+        float val = std::ldexp(static_cast<float>(mant), -24);
+        return sign ? -val : val;
+      }
+      float val = std::ldexp(static_cast<float>(mant + 1024), exp - 25);
+      return sign ? -val : val;
+    };
+    float first = fp16_to_fp32(data[0]);
+    stats.min_val = first;
+    stats.max_val = first;
+    double sum = 0;
+    for (int64_t i = 0; i < numel; ++i) {
+      float v = fp16_to_fp32(data[i]);
+      if (std::isnan(v)) { stats.num_nan++; continue; }
+      if (std::isinf(v)) { stats.num_inf++; continue; }
+      if (v == 0.0f) stats.num_zero++;
+      if (v < stats.min_val) stats.min_val = v;
+      if (v > stats.max_val) stats.max_val = v;
+      sum += v;
+    }
+    stats.mean_val = (numel > stats.num_nan + stats.num_inf)
+                     ? sum / (numel - stats.num_nan - stats.num_inf) : 0;
+  } else if (cpu_tensor.DataType() == DataType::BFloat(16)) {
+    const uint16_t* data = static_cast<const uint16_t*>(cpu_tensor->data);
+    auto bf16_to_fp32 = [](uint16_t h) -> float {
+      uint32_t bits = static_cast<uint32_t>(h) << 16;
+      float val;
+      std::memcpy(&val, &bits, sizeof(float));
+      return val;
+    };
+    float first = bf16_to_fp32(data[0]);
+    stats.min_val = first;
+    stats.max_val = first;
+    double sum = 0;
+    for (int64_t i = 0; i < numel; ++i) {
+      float v = bf16_to_fp32(data[i]);
+      if (std::isnan(v)) { stats.num_nan++; continue; }
+      if (std::isinf(v)) { stats.num_inf++; continue; }
+      if (v == 0.0f) stats.num_zero++;
+      if (v < stats.min_val) stats.min_val = v;
+      if (v > stats.max_val) stats.max_val = v;
+      sum += v;
+    }
+    stats.mean_val = (numel > stats.num_nan + stats.num_inf)
+                     ? sum / (numel - stats.num_nan - stats.num_inf) : 0;
+  }
+  return stats;
+}
+
+inline std::string FormatTensorStats(const std::string& name, const TensorStats& s) {
+  std::ostringstream oss;
+  oss << name << " stats: min=" << std::fixed << std::setprecision(4) << s.min_val
+      << " max=" << s.max_val << " mean=" << s.mean_val
+      << " nan=" << s.num_nan << " inf=" << s.num_inf
+      << " zero=" << s.num_zero << "/" << s.total;
+  return oss.str();
 }
 
 inline int64_t GetDataTypeBytes(DLDataType dtype) {

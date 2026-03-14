@@ -9,6 +9,7 @@
 #include <tvm/runtime/device_api.h>
 
 #include <cmath>
+#include <iomanip>
 #include <numeric>
 
 #include "../config.h"
@@ -102,6 +103,20 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
           continue;
         }
         Tensor projected_target_hidden = it->second.View();
+        LOG(WARNING) << "[DFlash-draft] projected_target_hidden shape=["
+                     << projected_target_hidden->shape[0] << ","
+                     << projected_target_hidden->shape[1] << ","
+                     << projected_target_hidden->shape[2]
+                     << "] dtype=" << projected_target_hidden->dtype;
+        {
+          TensorStats pth_stats = ComputeTensorStats(projected_target_hidden);
+          LOG(WARNING) << "[DFlash-draft] " << FormatTensorStats("projected_ctx", pth_stats);
+        }
+
+        LOG(WARNING) << "[DFlash-draft] req=" << req_idx
+                     << " internal_id=" << internal_id
+                     << " ctx_len=" << projected_target_hidden->shape[1]
+                     << " block_size=" << block_size;
 
         // TODO(dflash): Read mask_token_id from DFlash model config.
         int mask_token_id = 151669;  // Default for Qwen3-8B-DFlash-b16
@@ -147,6 +162,10 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
         // 5. Get logits via target model's LM head (shared).
         // Reshape draft_hidden from [1, block_size, h] to [block_size, h] for GetLogits.
         Tensor draft_hidden_nd = Downcast<Tensor>(draft_hidden);
+        {
+          TensorStats dh_stats = ComputeTensorStats(draft_hidden_nd);
+          LOG(WARNING) << "[DFlash-draft] " << FormatTensorStats("draft_hidden_out", dh_stats);
+        }
         Tensor reshaped_hidden =
             draft_hidden_nd.CreateView({block_size, hidden_size}, draft_hidden_nd->dtype);
         Tensor logits;
@@ -190,6 +209,17 @@ class DFlashBatchDraftActionObj : public EngineActionObj {
           for (int d = 0; d < num_draft; ++d) {
             sample_results.push_back(
                 SampleResult{{ArgmaxTokenId(logits_on_host, d + 1), 1.0f}, {}});
+          }
+          // Log draft model's top-5 per position
+          {
+            TensorStats logit_stats = ComputeTensorStats(logits_on_host);
+            LOG(WARNING) << "[DFlash-draft] " << FormatTensorStats("draft_logits", logit_stats);
+            for (int d = 0; d < std::min(num_draft, 8); ++d) {
+              auto topk = TopKLogits(logits_on_host, d + 1, 5);
+              LOG(WARNING) << "[DFlash-draft] pos=" << (d + 1)
+                           << " chosen=" << sample_results[d].GetTokenId()
+                           << " top5=" << FormatTopK(topk);
+            }
           }
         } else {
           probs_on_device = logit_processor_->ComputeProbsFromLogits(logits, rep_gen_cfg,

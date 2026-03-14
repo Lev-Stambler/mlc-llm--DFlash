@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <exception>
+#include <iomanip>
 #include <numeric>
 
 #include "../../support/random.h"
@@ -150,6 +151,40 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
         int verify_start = cum_verify_lengths[i];
         int draft_length = verify_lengths[i] - 1;
         int draft_token_idx = 0;
+        // Debug: per-position top-5 logit comparison (draft vs target)
+        {
+          LOG(WARNING) << "[DFlash-debug] req=" << i
+                       << " draft_len=" << draft_length
+                       << " verify_start=" << verify_start;
+          for (int d = 0; d < std::min(draft_length, 8); ++d) {
+            int32_t draft_tok = draft_output_tokens[i][d].GetTokenId();
+            auto target_topk = TopKLogits(logits_on_host, verify_start + d, 5);
+            int32_t target_tok = target_topk.empty() ? -1 : target_topk[0].token_id;
+            bool match = (draft_tok == target_tok);
+            // Find draft token's rank in target logits
+            int draft_rank = -1;
+            float draft_logit_in_target = 0;
+            int64_t vocab_size = logits_on_host->shape[1];
+            const float* target_row = static_cast<const float*>(logits_on_host->data)
+                                      + (verify_start + d) * vocab_size;
+            draft_logit_in_target = target_row[draft_tok];
+            // Compute approximate rank
+            int rank = 0;
+            for (int64_t t = 0; t < vocab_size; ++t) {
+              if (target_row[t] > draft_logit_in_target) rank++;
+            }
+            draft_rank = rank;
+
+            LOG(WARNING) << "  pos=" << d
+                         << (match ? " MATCH" : " MISS")
+                         << " draft=" << draft_tok
+                         << " target=" << target_tok
+                         << " draft_rank_in_target=" << draft_rank
+                         << " draft_logit=" << std::fixed << std::setprecision(2)
+                         << draft_logit_in_target
+                         << " target_top5=" << FormatTopK(target_topk);
+          }
+        }
         for (; draft_token_idx < draft_length; ++draft_token_idx) {
           int32_t target_token_id = ArgmaxTokenId(logits_on_host, verify_start + draft_token_idx);
           if (target_token_id != draft_output_tokens[i][draft_token_idx].GetTokenId()) {
@@ -206,6 +241,10 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
       rsentries[i]->rstate->metrics.decode_tokens += accept_length;
       estate->metrics.spec_decode.Update(cum_verify_lengths[i + 1] - cum_verify_lengths[i],
                                          accept_length);
+      LOG(WARNING) << "[DFlash] request=" << rsentries[i]->request->id
+                << " draft_len=" << draft_lengths[i]
+                << " accepted=" << accept_length
+                << " rate=" << (100.0 * accept_length / (draft_lengths[i] + 1)) << "%";
 
       // Commit accepted tokens to target model KV cache
       verify_model_seq_internal_ids.push_back(rsentries[i]->mstates[verify_model_id_]->internal_id);
@@ -232,8 +271,24 @@ class DFlashBatchVerifyActionObj : public EngineActionObj {
     // of the next block (in noise_embedding), not part of the context.
     {
       RECORD_EVENT(trace_recorder_, request_ids, "start project target hidden (verify)");
+      {
+        Tensor th = Downcast<Tensor>(target_hidden);
+        LOG(WARNING) << "[DFlash] target_hidden shape=["
+                     << th->shape[0] << "," << th->shape[1] << "," << th->shape[2]
+                     << "] dtype=" << th->dtype;
+        TensorStats th_stats = ComputeTensorStats(th);
+        LOG(WARNING) << "[DFlash] " << FormatTensorStats("target_hidden", th_stats);
+      }
       Tensor verify_projected =
           Downcast<Tensor>(models_[draft_model_id_]->ProjectTargetHiddenStates(target_hidden));
+      LOG(WARNING) << "[DFlash] verify_projected shape=["
+                   << verify_projected->shape[0] << "," << verify_projected->shape[1]
+                   << "," << verify_projected->shape[2]
+                   << "] dtype=" << verify_projected->dtype;
+      {
+        TensorStats vp_stats = ComputeTensorStats(verify_projected);
+        LOG(WARNING) << "[DFlash] " << FormatTensorStats("verify_projected", vp_stats);
+      }
       auto& pth_map = *model_workspaces_[0].dflash_projected_target_hidden;
       int64_t verify_offset = 0;
 
